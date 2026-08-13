@@ -1,0 +1,121 @@
+---
+title: "Task performance analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(glmmTMB)
+library(here)
+library(scales)
+```
+
+# Settings
+
+```{r settings, include=FALSE}
+VALID_IDS <- c(
+  "11", "21", "8", "7_p", "7_a", "14_p", "14_a",
+  "59", "62", "63", "64", "67", "60"
+)
+
+TRIAL_YEARS <- c("2024", "2025")
+
+trial_paths <- function(suffix) {
+  stats::setNames(
+    here::here("rawdata", paste0(TRIAL_YEARS, suffix)),
+    TRIAL_YEARS
+  )
+}
+
+read_trial_year <- function(path, year, coding = FALSE) {
+  data <- read.csv(path, na.strings = c("", "NA"))
+
+  if (coding) {
+    data <- data %>%
+      dplyr::mutate(time_code = as.character(time_code))
+  } else {
+    data <- data %>%
+      dplyr::filter(test_phase == "trial")
+  }
+
+  data %>%
+    dplyr::filter(id %in% VALID_IDS) %>%
+    dplyr::mutate(
+      year = year,
+      id = paste0(id, "_", year)
+    )
+}
+```
+
+# Data loading
+
+```{r data-loading}
+years_result <- trial_paths("_trials.csv")
+years_coding <- trial_paths("_trials_coding.csv")
+
+data_result <- purrr::imap_dfr(
+  years_result,
+  ~ read_trial_year(.x, .y, coding = FALSE)
+)
+
+data_coding <- purrr::imap_dfr(
+  years_coding,
+  ~ read_trial_year(.x, .y, coding = TRUE)
+)
+
+peck <- data_coding %>%
+  dplyr::group_by(id, test_number) %>%
+  dplyr::summarise(
+    peck = sum(peck, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+motivated <- data_result %>%
+  dplyr::left_join(peck, by = c("id", "test_number")) %>%
+  dplyr::mutate(success = as.integer(obtained == 1 & peck == 0)) %>%
+  dplyr::filter(!(peck == 0 & obtained == 0)) %>%
+  dplyr::group_by(id) %>%
+  dplyr::arrange(test_number, .by_group = TRUE) %>%
+  dplyr::mutate(test_number2 = dplyr::row_number()) %>%
+  dplyr::ungroup()
+
+success_rate <- motivated %>%
+  dplyr::group_by(id) %>%
+  dplyr::summarise(
+    success_rate = mean(success, na.rm = TRUE),
+    n_trials = dplyr::n(),
+    .groups = "drop"
+  )
+
+motivated <- motivated %>%
+  dplyr::left_join(success_rate, by = "id")
+```
+
+# Summary
+
+```{r summary}
+success_rate %>%
+  dplyr::summarise(
+    mean_success = mean(success_rate, na.rm = TRUE),
+    sd_success = stats::sd(success_rate, na.rm = TRUE)
+  )
+```
+
+# Success probability
+
+```{r success-probability}
+model <- glmmTMB::glmmTMB(
+  success ~ test_number2 + (1 + test_number2 | id),
+  data = motivated,
+  family = stats::binomial()
+)
+
+summary(model)
+```
+

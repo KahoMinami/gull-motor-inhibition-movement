@@ -1,0 +1,1362 @@
+---
+title: "Hidden Markov model fitting"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(zoo)
+library(here)
+library(purrr)
+library(scales)
+library(ggforce)
+library(ggspatial)
+library(patchwork)
+library(cowplot)
+library(knitr)
+library(kableExtra)
+library(sf)
+library(sp)
+library(geosphere)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rosm)
+library(raster)
+library(ggeffects)
+library(splines)
+library(momentuHMM)
+library(glmmTMB)
+
+source(here::here("code", "_shared.R"))
+```
+
+```{r directories, include=FALSE}
+ensure_project_dirs()
+```
+
+# 03: fit and save heavy HMM objects
+
+Run crawlWrap and HMM fitting, then save objects needed by the downstream script as RDS files.
+
+# Data input
+
+Analysis settings
+
+```{r}
+HMM_SETTINGS <- list(
+  section_gap_min = 30,
+  section_min_points = 13, # 13 five-minute points: more than 60 min
+  min_nest_distance_km = 1,
+  sea_block_min_points = 6,
+  random_seed = 123,
+  random_starts = 20,
+  individual_random_starts = 20
+)
+
+HMM_PATHS <- list(
+  breakwater = here::here("rawdata", "Kab_4.gpkg"),
+  coastline = here::here("rawdata", "gadm41_JPN_shp", "gadm41_JPN_0.shp"),
+  gps = here::here("outputs", "resampling.csv"),
+  fitted_objects = here::here("outputs", "03_HMM", "03_fit_objects.rds")
+)
+
+assert_input_files(unlist(HMM_PATHS[c("breakwater", "coastline", "gps")]))
+
+# Keep the original variable names below so the statistical pipeline is unchanged.
+cut_time <- HMM_SETTINGS$section_gap_min
+min_sec_time <- HMM_SETTINGS$section_min_points
+min_nest_dist <- HMM_SETTINGS$min_nest_distance_km
+nest <- unname(NEST_COORDS)
+```
+
+maps
+
+```{r}
+# Breakwater polygon
+kab <- st_read(HMM_PATHS$breakwater, layer = "kab4__kab")
+kab$category <- ifelse(!is.na(kab$breakwater), "breakwater", NA)
+b_sf <- kab[kab$category == "breakwater", ]
+b_sf <- st_make_valid(b_sf) # Fix invalid geometries
+
+# GADM
+coast <- st_read(HMM_PATHS$coastline)
+coast <- st_make_valid(coast)
+```
+
+GPS data loading
+
+```{r}
+# GPS data
+data0 <- read_csv(HMM_PATHS$gps)
+
+# convert to sf object
+data0 <- data0 %>% st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# extract lon/lat and drop geometry
+coords <- sf::st_coordinates(data0)
+data0 <- data0 %>%
+  dplyr::mutate(lon = coords[, "X"], lat = coords[, "Y"]) %>%
+  sf::st_drop_geometry()
+```
+
+task score
+
+```{r}
+# success rate
+score <- tribble(
+  ~id, ~success_rate,
+  "62206", 0.40,
+  "62207", 0.00,
+  "671",   0.60,
+  "675",   0.50,
+  "681",   0.40,
+  "683",   0.00,
+  "685",   0.38,
+  "ATK_29B_S1", 0.00,
+  "ATK_2B_S1",  0.40,
+  "ATK_6E_S1",  0.60,
+  "BTG_KAB_2025_9B01831_S1", 0.11,
+  "BTG_KAB_2025_9B03427_S1", 0.67,
+  "BTG_KAB_2025_9B40989_S2", 0.25
+)
+
+
+# z-standardize (mean = 0, SD = 1)
+score <-score %>% mutate(score_sc = as.numeric(scale(success_rate)))
+
+success_rate_by_id <- score %>%
+  dplyr::transmute(
+    id = as.character(id),
+    success_rate
+  )
+
+data0 <- data0 %>% filter(id %in% score$id)
+
+cat(length(unique(data0$id)), "individuals are included in the data.\n")
+
+data0$id %>% unique()
+```
+
+# Data processing
+
+exclude points within min_nest_dist of the nest
+
+```{r}
+data0 <- data0 %>%
+  mutate(nest_dist  = distGeo(nest, dplyr::select(., lon, lat)) / 1000) %>% # distance from nest (km)
+  filter(nest_dist >= min_nest_dist)
+```
+
+Create continuous sections and unique section identifiers
+
+```{r}
+data <- data0 %>%
+  group_by(id) %>%
+  arrange(time) %>% 
+  mutate(
+    time_diff = c(0, as.numeric(diff(time), units = "secs") / 60),  # time gap between points (min)
+    section_id = cumsum(time_diff > cut_time) + 1                   # start new section if gap > cut_time
+  ) %>%
+  group_by(id, section_id) %>%
+  filter(n() >= min_sec_time) %>%                                   
+  ungroup() %>%
+  mutate(ID = paste(id, section_id, sep = "_")) %>%                 # unique section ID
+  dplyr::select(-time_diff)
+```
+
+estuary classification
+
+Identify whether each GPS location was recorded within the estuary area, defined as being within 800 m of estuary_1 or 500 m of estuary_2
+
+```{r}
+#* Define the coordinates of the two estuary reference points
+estuary_1 <- c(141.508143, 40.543210)
+estuary_2 <- c(141.462772, 40.601823)
+
+#* Define the radius around each estuary point (in meters)
+radius1_m <- 0.8 * 1000  # km -> m
+radius2_m <- 0.5 * 1000
+
+#* Classify each location as estuary-associated if it falls within
+#* the specified radius of either estuary reference point
+data <- data %>%rowwise() %>% 
+  mutate(estuary = (distHaversine(c(lon, lat), estuary_1) <= radius1_m) | (distHaversine(c(lon, lat), estuary_2) <= radius2_m)
+  ) %>%
+  ungroup()
+```
+
+specify time zone with NOAA NCAT
+
+```{r}
+rawData <- dplyr::select(data, time, lon, lat, ID, section_id, estuary) 
+
+llcoord  <- SpatialPoints(rawData[,2:3], proj4string=CRS("+proj=longlat +datum=WGS84"))
+utmcoord <- spTransform(llcoord, CRS("+proj=utm +zone=54 ellps=WGS84"))
+
+rawData$x <- attr(utmcoord, "coords")[,1]
+rawData$y <- attr(utmcoord, "coords")[,2]
+```
+
+estuary classification 2
+
+```{r}
+rawData <- rawData %>%
+  mutate(id = sub("_([^_]+)$", "", ID)) %>%
+  arrange(id, time) %>%
+  group_by(id) %>%
+  mutate(section_change = (section_id != lag(section_id, default = first(section_id))),   
+    after_estuary = (estuary == FALSE & lag(estuary, default = FALSE) == TRUE),
+    new_section_flag = section_change | after_estuary,
+    section_id_est = cumsum(new_section_flag) + 1,
+    ID_est = paste0(id, "_", section_id_est)
+  ) %>%
+  ungroup() %>% dplyr::select(-section_change, -after_estuary, -new_section_flag)
+
+rawData <- rawData %>% arrange(ID, time)
+```
+
+# crawlWrap → prepData
+
+```{r}
+set.seed(HMM_SETTINGS$random_seed)
+
+# crawlWrap one ID at a time, retrying failed IDs automatically
+# Final output: df_crw
+
+
+# Convert crwPredict object to a plain data.frame
+as_plain_crw_df <- function(x) {
+  x <- as.data.frame(x)
+  class(x) <- setdiff(class(x), "crwPredict")
+  x
+}
+
+# Run crawlWrap once for a single ID with a given setting
+run_crawlwrap_once <- function(one, setting, time_step = "5 min") {
+  
+  args <- list(
+    obsData   = one,
+    timeStep  = time_step,
+    fixPar    = c(NA, NA),
+    attempts  = setting$attempts,
+    retryFits = setting$retryFits,
+    retrySD   = setting$retrySD
+  )
+  
+  # Important:
+  # If setting$theta is NULL, do not pass theta at all.
+  # Passing theta = NULL explicitly can cause an error in crawlWrap.
+  if (!is.null(setting$theta)) {
+    args$theta <- setting$theta
+  }
+  
+  do.call(momentuHMM::crawlWrap, args)
+}
+
+# Settings to try for each ID.
+# The first setting is your original setting.
+# Later settings are only used if the ID fails.
+crawl_retry_plan <- list(
+  list(
+    label     = "original_theta_10_-1.5_sd1",
+    theta     = c(10, -1.5),
+    attempts  = 100,
+    retryFits = 10,
+    retrySD   = 1
+  ),
+  list(
+    label     = "theta_10_-1.5_more_attempts_sd1",
+    theta     = c(10, -1.5),
+    attempts  = 300,
+    retryFits = 20,
+    retrySD   = 1
+  ),
+  list(
+    label     = "theta_10_-1.5_sd0.5",
+    theta     = c(10, -1.5),
+    attempts  = 300,
+    retryFits = 20,
+    retrySD   = 0.5
+  ),
+  list(
+    label     = "theta_10_-1.5_sd2",
+    theta     = c(10, -1.5),
+    attempts  = 300,
+    retryFits = 20,
+    retrySD   = 2
+  ),
+  list(
+    label     = "theta_6.855_-0.007_sd1",
+    theta     = c(6.855, -0.007),
+    attempts  = 300,
+    retryFits = 20,
+    retrySD   = 1
+  ),
+  list(
+    label     = "theta_0_0_sd1",
+    theta     = c(0, 0),
+    attempts  = 300,
+    retryFits = 20,
+    retrySD   = 1
+  ),
+  list(
+    label     = "theta_missing_default_sd1",
+    theta     = NULL,   # this means theta is omitted from the crawlWrap call
+    attempts  = 300,
+    retryFits = 20,
+    retrySD   = 1
+  )
+)
+
+# Fit one ID until success, or until all settings/cycles are exhausted
+fit_one_id_until_success <- function(
+  target_id,
+  dat,
+  retry_plan = crawl_retry_plan,
+  max_cycles = 5,
+  time_step = "5 min"
+) {
+  
+  one <- dat %>%
+    dplyr::filter(ID == target_id) %>%
+    dplyr::arrange(time) %>%
+    as.data.frame()
+  
+  if (nrow(one) < 3) {
+    return(list(
+      success = FALSE,
+      ID = target_id,
+      pred = NULL,
+      log = tibble::tibble(
+        ID = target_id,
+        cycle = NA_integer_,
+        setting = "too_few_rows",
+        success = FALSE,
+        n_pred = 0L,
+        error = "Fewer than 3 rows",
+        n_warnings = 0L
+      )
+    ))
+  }
+  
+  logs <- list()
+  log_i <- 1
+  
+  for (cycle in seq_len(max_cycles)) {
+    
+    for (k in seq_along(retry_plan)) {
+      
+      setting <- retry_plan[[k]]
+      
+      message(
+        "Fitting ID: ", target_id,
+        " | cycle: ", cycle,
+        " | setting: ", setting$label
+      )
+      
+      warnings_here <- character()
+      
+      fit_try <- tryCatch(
+        withCallingHandlers(
+          run_crawlwrap_once(
+            one = one,
+            setting = setting,
+            time_step = time_step
+          ),
+          warning = function(w) {
+            warnings_here <<- c(warnings_here, conditionMessage(w))
+            invokeRestart("muffleWarning")
+          }
+        ),
+        error = function(e) e
+      )
+      
+      # If crawlWrap itself failed
+      if (inherits(fit_try, "error")) {
+        logs[[log_i]] <- tibble::tibble(
+          ID = target_id,
+          cycle = cycle,
+          setting = setting$label,
+          success = FALSE,
+          n_pred = 0L,
+          error = conditionMessage(fit_try),
+          n_warnings = length(warnings_here)
+        )
+        log_i <- log_i + 1
+        next
+      }
+      
+      # If crawlWrap returned no crwPredict
+      if (!"crwPredict" %in% names(fit_try) || is.null(fit_try$crwPredict)) {
+        logs[[log_i]] <- tibble::tibble(
+          ID = target_id,
+          cycle = cycle,
+          setting = setting$label,
+          success = FALSE,
+          n_pred = 0L,
+          error = "No crwPredict returned",
+          n_warnings = length(warnings_here)
+        )
+        log_i <- log_i + 1
+        next
+      }
+      
+      pred <- as_plain_crw_df(fit_try$crwPredict)
+      
+      # Force ID to remain the original section ID.
+      # This is critical for keeping the downstream ID/ID_est logic unchanged.
+      pred$ID <- as.character(target_id)
+      
+      # Basic validity check
+      required_cols <- c("ID", "time", "mu.x", "mu.y", "estuary", "ID_est")
+      pred_ok <- nrow(pred) > 0 &&
+        all(required_cols %in% names(pred)) &&
+        all(!is.na(pred$ID)) &&
+        any(!is.na(pred$mu.x)) &&
+        any(!is.na(pred$mu.y))
+      
+      if (!pred_ok) {
+        logs[[log_i]] <- tibble::tibble(
+          ID = target_id,
+          cycle = cycle,
+          setting = setting$label,
+          success = FALSE,
+          n_pred = nrow(pred),
+          error = "crwPredict returned, but required columns or mu.x/mu.y are missing",
+          n_warnings = length(warnings_here)
+        )
+        log_i <- log_i + 1
+        next
+      }
+      
+      logs[[log_i]] <- tibble::tibble(
+        ID = target_id,
+        cycle = cycle,
+        setting = setting$label,
+        success = TRUE,
+        n_pred = nrow(pred),
+        error = NA_character_,
+        n_warnings = length(warnings_here)
+      )
+      
+      return(list(
+        success = TRUE,
+        ID = target_id,
+        pred = pred,
+        log = dplyr::bind_rows(logs)
+      ))
+    }
+  }
+  
+  # If all attempts failed
+  list(
+    success = FALSE,
+    ID = target_id,
+    pred = NULL,
+    log = dplyr::bind_rows(logs)
+  )
+}
+
+# Use the same ID order as rawData
+all_ids <- unique(as.character(rawData$ID))
+
+# Run crawlWrap one ID at a time
+crawl_results <- purrr::map(
+  all_ids,
+  ~ fit_one_id_until_success(
+    target_id = .x,
+    dat = rawData,
+    retry_plan = crawl_retry_plan,
+    max_cycles = 5,
+    time_step = "5 min"
+  )
+)
+
+# Attempt log
+crawl_log <- dplyr::bind_rows(purrr::map(crawl_results, "log"))
+
+# Check failed IDs
+success_ids <- crawl_results %>%
+  purrr::keep(~ .x$success) %>%
+  purrr::map_chr("ID")
+
+failed_ids <- setdiff(all_ids, success_ids)
+
+cat("Original IDs:", length(all_ids), "\n")
+cat("Successful IDs:", length(success_ids), "\n")
+cat("Failed IDs:", length(failed_ids), "\n")
+
+if (length(failed_ids) > 0) {
+  print(failed_ids)
+  print(crawl_log %>% dplyr::filter(ID %in% failed_ids))
+  
+  partial_rds_dir <- here::here("outputs", "HMM_YG2")
+  dir.create(partial_rds_dir, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(
+    list(
+      all_ids = all_ids,
+      success_ids = success_ids,
+      failed_ids = failed_ids,
+      crawl_results = crawl_results,
+      crawl_log = crawl_log,
+      rawData = rawData,
+      score = score,
+      success_rate_by_id = success_rate_by_id
+    ),
+    file.path(partial_rds_dir, "HMM_YG2_crawlwrap_partial_results.rds")
+  )
+  cat(
+    "Saved partial crawlWrap results to:",
+    file.path(partial_rds_dir, "HMM_YG2_crawlwrap_partial_results.rds"),
+    "\n"
+  )
+  
+  stop("Some IDs still failed in crawlWrap. Check crawl_log.")
+}
+
+# Combine all successful predictions.
+# This becomes the same downstream object as before: df_crw
+df_crw <- crawl_results %>%
+  purrr::map("pred") %>%
+  dplyr::bind_rows() %>%
+  dplyr::mutate(
+    ID = as.character(ID),
+    time = as.POSIXct(time, tz = "UTC")
+  ) %>%
+  dplyr::arrange(ID, time) %>%
+  as.data.frame()
+
+# Same downstream processing as your original code
+df_crw <- df_crw %>%
+  dplyr::mutate(id = sub("_[^_]+$", "", ID))
+
+df_crw <- df_crw %>%
+  dplyr::left_join(score %>% dplyr::distinct(id, score_sc), by = "id")
+
+# Final checks
+df_crw_check <- df_crw %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    n_ID = dplyr::n_distinct(ID),
+    NA_ID = sum(is.na(ID)),
+    NA_time = sum(is.na(time)),
+    NA_mu.x = sum(is.na(mu.x)),
+    NA_mu.y = sum(is.na(mu.y)),
+    NA_estuary = sum(is.na(estuary)),
+    NA_ID_est = sum(is.na(ID_est)),
+    NA_score_sc = sum(is.na(score_sc))
+  )
+
+print(df_crw_check)
+
+
+critical_na_cols <- c("NA_ID", "NA_time", "NA_mu.x", "NA_mu.y", "NA_score_sc")
+critical_na <- unlist(df_crw_check[critical_na_cols])
+if (any(critical_na > 0)) {
+  stop(
+    "Critical NA values remain after crawlWrap: ",
+    paste(names(critical_na)[critical_na > 0], critical_na[critical_na > 0], sep = "=", collapse = ", ")
+  )
+}
+
+if (df_crw_check$NA_estuary > 0) {
+  warning("NA values remain in estuary before locf: ", df_crw_check$NA_estuary)
+}
+
+if (df_crw_check$NA_ID_est > 0) {
+  warning("NA values remain in ID_est before locf: ", df_crw_check$NA_ID_est)
+}
+
+# Optional: inspect which settings succeeded
+crawl_log %>%
+  dplyr::filter(success) %>%
+  dplyr::count(setting)
+```
+
+Prepare sea-track data for HMM
+
+```{r}
+# Fill estuary labels within each individual
+df_crw2 <- df_crw %>%
+  dplyr::arrange(ID, time) %>%
+  dplyr::group_by(ID) %>%
+  dplyr::mutate(
+    estuary = zoo::na.locf(zoo::na.locf(estuary, na.rm = FALSE), fromLast = TRUE, na.rm = FALSE),
+    ID_est = zoo::na.locf(zoo::na.locf(ID_est, na.rm = FALSE), fromLast = TRUE, na.rm = FALSE)
+  ) %>%
+  dplyr::ungroup() %>%
+  as.data.frame()
+
+df_crw2_check <- df_crw2 %>%
+  dplyr::summarise(
+    NA_estuary = sum(is.na(estuary)),
+    NA_ID_est = sum(is.na(ID_est))
+  )
+
+print(df_crw2_check)
+
+if (df_crw2_check$NA_estuary > 0 || df_crw2_check$NA_ID_est > 0) {
+  stop(
+    "NA values remain after filling estuary/ID_est labels: ",
+    paste(names(df_crw2_check), unlist(df_crw2_check), sep = "=", collapse = ", ")
+  )
+}
+
+
+# Remove estuary points and short ID_est segments
+df_keep <- df_crw2 %>%
+  dplyr::arrange(ID, time) %>%
+  dplyr::filter(estuary == FALSE) %>%
+  dplyr::group_by(ID_est) %>%
+  dplyr::filter(dplyr::n() >= 6) %>%
+  dplyr::ungroup() %>%
+  as.data.frame()
+
+
+# Classify locations as land, sea, or breakwater
+data_xy <- sf::st_as_sf(
+  df_keep,
+  coords = c("mu.x", "mu.y"),
+  crs = 32654
+)
+
+data_xy_ll <- sf::st_transform(data_xy, 4326)
+coast_wgs <- sf::st_transform(coast, 4326)
+
+sf::sf_use_s2(TRUE)
+
+data_located <- sf::st_join(data_xy_ll, coast_wgs, left = TRUE) %>%
+  dplyr::mutate(
+    coast = ifelse(is.na(COUNTRY), "sea", "land")
+  )
+
+sf::sf_use_s2(FALSE)
+
+breakwater_hit <- lengths(sf::st_intersects(data_located, b_sf)) > 0
+
+data_located <- data_located %>%
+  dplyr::mutate(
+    on_breakwater = breakwater_hit,
+    location = ifelse(on_breakwater, "land", coast)
+  ) %>%
+  dplyr::select(-dplyr::any_of(c("GID_0", "COUNTRY"))) %>%
+  sf::st_drop_geometry() %>%
+  as.data.frame()
+
+df_keep <- df_keep %>%
+  dplyr::left_join(
+    data_located %>%
+      dplyr::select(ID_est, time, location, on_breakwater),
+    by = c("ID_est", "time")
+  )
+
+
+# Rename ID columns for HMM analysis
+df_keep <- df_keep %>%
+  dplyr::select(-dplyr::any_of(c("x", "y"))) %>%
+  dplyr::rename(
+    ID_real = ID,
+    ID = ID_est
+  ) %>%
+  dplyr::mutate(
+    ID = as.character(ID),
+    ID_real = as.character(ID_real),
+    time = as.POSIXct(time, tz = "UTC"),
+    mu.x = as.numeric(mu.x),
+    mu.y = as.numeric(mu.y)
+  ) %>%
+  as.data.frame()
+
+
+# Identify continuous sea/land blocks
+df_keep <- df_keep %>%
+  dplyr::arrange(ID, time) %>%
+  dplyr::group_by(ID) %>%
+  dplyr::mutate(
+    loc_bin = ifelse(location == "land", "land", "sea"),
+    block_change = loc_bin != dplyr::lag(loc_bin, default = dplyr::first(loc_bin)),
+    block_num = cumsum(block_change),
+    ID_block = paste0(ID, "_", loc_bin, "_", block_num)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-block_change, -block_num)
+
+
+# Keep only sea blocks that meet the pre-specified minimum length.
+df_sea <- df_keep %>%
+  dplyr::filter(loc_bin == "sea") %>%
+  dplyr::group_by(ID_block) %>%
+  dplyr::filter(dplyr::n() >= HMM_SETTINGS$sea_block_min_points) %>%
+  dplyr::ungroup()
+
+cat("Number of sea blocks:", dplyr::n_distinct(df_sea$ID_block), "\n")
+
+
+# Prepare data for momentuHMM
+cols_needed <- c(
+  "ID_block",
+  "time",
+  "mu.x",
+  "mu.y",
+  "location",
+  "on_breakwater",
+  "id",
+  "ID_real",
+  "loc_bin"
+)
+
+Data_pre <- momentuHMM::prepData(
+  data = df_sea %>%
+    dplyr::select(dplyr::all_of(cols_needed)) %>%
+    dplyr::rename(ID = ID_block) %>%
+    as.data.frame(),
+  coordNames = c("mu.x", "mu.y")
+)
+
+
+# Add cognitive score
+Data_HMM <- Data_pre
+
+Data_HMM$id <- sub("_[^_]+$", "", Data_HMM$ID_real)
+Data_HMM$score_sc <- score$score_sc[match(Data_HMM$id, score$id)]
+Data_HMM$id_factor <- factor(Data_HMM$id)
+
+# Replace zero step lengths with a small positive value
+Data_HMM$step[
+  !is.na(Data_HMM$step) & Data_HMM$step == 0
+] <- 1e-6
+```
+
+# HMM with covariates
+
+HMM parameters
+
+```{r}
+dist <- list(step = "gamma", angle = "vm")
+
+jitter_Par0_state <- function(Par0, prop = 0.2){
+  lapply(Par0, function(x){
+    is_coef0 <- x == 0
+    out <- x
+    out[!is_coef0] <- x[!is_coef0] + log(runif(sum(!is_coef0), 1 - prop, 1 + prop))
+    out
+  })
+}
+
+stateNames <- HMM_STATE_NAMES
+
+DM <- list(
+  step = list(
+    mean = ~ state1(score_sc) + state2(score_sc),
+    sd   = ~ 1
+  ),
+  angle = list(
+    concentration = ~ state1(score_sc) + state2(score_sc)
+  )
+)
+
+step_mean   <- c(2600, 900, 50, 100)
+step_sd     <- c(800, 500, 50, 50)
+angle_conc  <- c(10, 1, 0.1, 8)
+
+Par0 <- list(
+  step = c(
+    log(step_mean[1]), 0,
+    log(step_mean[2]), 0,
+    log(step_mean[3]),
+    log(step_mean[4]),
+    log(step_sd[1]),
+    log(step_sd[2]),
+    log(step_sd[3]),
+    log(step_sd[4])
+  ),
+  angle = c(
+    log(angle_conc[1]), 0,
+    log(angle_conc[2]), 0,
+    log(angle_conc[3]), 
+    log(angle_conc[4])
+  )
+)
+```
+
+fitHMM
+
+```{r}
+set.seed(HMM_SETTINGS$random_seed)
+
+n_try <- HMM_SETTINGS$random_starts
+model_list <- list()
+aic_values <- rep(NA_real_, n_try)
+conv <- rep(FALSE, n_try)
+init_list <- vector("list", n_try)
+
+for(i in 1:n_try){
+  if(i == 1){
+    Par0_try <- Par0
+  } else {
+    Par0_try <- jitter_Par0_state(Par0, prop = 0.2)
+  }
+  
+  init_list[[i]] <- Par0_try
+  
+  tryCatch({
+    m <- fitHMM(
+      data = Data_HMM,
+      nbStates = 4,
+      dist = dist,
+      Par0 = Par0_try,
+      DM = DM,
+      formula = ~ score_sc,
+      estAngleMean = list(angle = FALSE),
+      stateNames = stateNames
+    )
+    
+    model_list[[i]] <- m
+    aic_values[i] <- AIC(m)
+    conv[i] <- TRUE
+    
+    cat("model", i, ": AIC =", aic_values[i], "\n")
+  }, error = function(e){
+    cat("model", i, "failed:", e$message, "\n")
+    conv[i] <<- FALSE
+    aic_values[i] <<- NA_real_
+  })
+}
+
+init_summary <- do.call(rbind, lapply(seq_along(init_list), function(i){
+  data.frame(
+    run = i,
+    step_1 = init_list[[i]]$step[1],
+    step_2 = init_list[[i]]$step[2],
+    step_3 = init_list[[i]]$step[3],
+    step_4 = init_list[[i]]$step[4],
+    step_5 = init_list[[i]]$step[5],
+    step_6 = init_list[[i]]$step[6],
+    step_7 = init_list[[i]]$step[7],
+    step_8 = init_list[[i]]$step[8],
+    step_9 = init_list[[i]]$step[9],
+    step_10 = init_list[[i]]$step[10],
+    angle_1 = init_list[[i]]$angle[1],
+    angle_2 = init_list[[i]]$angle[2],
+    angle_3 = init_list[[i]]$angle[3],
+    angle_4 = init_list[[i]]$angle[4],
+    angle_5 = init_list[[i]]$angle[5],
+    angle_6 = init_list[[i]]$angle[6]
+  )
+}))
+
+summary <- data.frame(
+  run = 1:n_try,
+  AIC = aic_values,
+  converged = conv
+) %>%
+  dplyr::left_join(init_summary, by = "run")
+
+print(summary)
+
+summary %>%
+  dplyr::mutate(
+    step_mean_directed_exp   = exp(step_1),
+    step_mean_undirected_exp = exp(step_3),
+    step_mean_ARS_exp        = exp(step_5),
+    step_mean_water_exp      = exp(step_6)
+  ) %>%
+  dplyr::select(
+    run,
+    AIC,
+    converged,
+    step_mean_directed_exp,
+    step_mean_undirected_exp,
+    step_mean_ARS_exp,
+    step_mean_water_exp
+  )
+```
+
+Summary of the best HMM
+
+```{r}
+results_summary <- data.frame(
+  run       = 1:n_try,
+  AIC       = aic_values,
+  converged = conv
+)
+print(results_summary)
+
+valid_runs <- which(conv & !is.na(aic_values))
+if (length(valid_runs) == 0) {
+  stop("No sea models converged successfully.")
+}
+
+best_run <- valid_runs[which.min(aic_values[valid_runs])]
+cat("Best run:", best_run, "\n")
+cat("Minimum AIC:", aic_values[best_run], "\n")
+
+best <- model_list[[best_run]]
+CIbeta(best)
+best
+```
+
+ State-dependent HMM parameter estimates at score_sc = 0
+
+```{r}
+score0 <- 0
+
+step_beta<- unlist(best$mle$step)
+angle_beta <- unlist(best$mle$angle)
+
+param_table <- data.frame(
+  state = stateNames,
+  step_mean = c(
+    exp(step_beta[1] + step_beta[2] * score0),
+    exp(step_beta[3] + step_beta[4] * score0),
+    exp(step_beta[5]),
+    exp(step_beta[6])
+  ),
+  step_sd = exp(step_beta[7:10]),
+  angle_concentration = c(
+    exp(angle_beta[1] + angle_beta[2] * score0),
+    exp(angle_beta[3] + angle_beta[4] * score0),
+    exp(angle_beta[5]),
+    exp(angle_beta[6])
+  )
+)
+
+param_table <- param_table %>%
+  dplyr::mutate(
+    step_mean = round(step_mean, 2),
+    step_sd = round(step_sd, 2),
+    angle_concentration = round(angle_concentration, 3)
+  )
+
+print(param_table)
+```
+
+Extract beta, SE, and 95% CI from covariate HMM
+
+```{r}
+ci_beta <- momentuHMM::CIbeta(best)
+
+extract_hmm_beta <- function(ci_beta, component, term, label) {
+  
+  tibble::tibble(
+    parameter = label,
+    beta = ci_beta[[component]]$est[1, term],
+    SE = ci_beta[[component]]$se[1, term],
+    CI_lower = ci_beta[[component]]$lower[1, term],
+    CI_upper = ci_beta[[component]]$upper[1, term]
+  )
+}
+
+hmm_beta_table <- dplyr::bind_rows(
+  extract_hmm_beta(
+    ci_beta,
+    component = "step",
+    term = "mean_1:score_sc",
+    label = "Step length: directed flight"
+  ),
+  extract_hmm_beta(
+    ci_beta,
+    component = "step",
+    term = "mean_2:score_sc",
+    label = "Step length: undirected flight"
+  ),
+  extract_hmm_beta(
+    ci_beta,
+    component = "angle",
+    term = "concentration_1:score_sc",
+    label = "Angle concentration: directed flight"
+  ),
+  extract_hmm_beta(
+    ci_beta,
+    component = "angle",
+    term = "concentration_2:score_sc",
+    label = "Angle concentration: undirected flight"
+  )
+) %>%
+  dplyr::mutate(
+    dplyr::across(
+      c(beta, SE, CI_lower, CI_upper),
+      ~ round(.x, 3)
+    )
+  )
+
+hmm_beta_table
+```
+
+
+Viterbi state 
+
+```{r}
+Data_HMM <- Data_HMM %>% 
+  dplyr::mutate(
+    ID = factor(ID),
+    id = factor(id),
+    state = factor(
+      momentuHMM::viterbi(best),
+      levels = 1:4,
+      labels = stateNames
+    )
+  )
+
+print(table(Data_HMM$state))
+print(table(Data_HMM$state) / nrow(Data_HMM))
+```
+
+
+# Individual-level HMM
+
+```{r}
+stateNames_ind <- stateNames
+
+dist_ind <- list(step = "gamma", angle = "vm")
+
+DM_ind <- list(
+  step = list(
+    mean = ~ 1,
+    sd   = ~ 1
+  ),
+  angle = list(
+    concentration = ~ 1
+  )
+)
+
+
+best_step_coef <- unlist(best$mle$step)
+best_angle_coef <- unlist(best$mle$angle)
+
+best_coef_index <- list(
+  step_mean = c(directed = 1, undirected = 3, ARS = 5, water = 6),
+  step_sd = c(directed = 7, undirected = 8, ARS = 9, water = 10),
+  angle_conc = c(directed = 1, undirected = 3, ARS = 5, water = 6)
+)
+
+if (length(best_step_coef) < max(c(best_coef_index$step_mean, best_coef_index$step_sd))) {
+  stop("best$mle$step does not contain the expected coefficients for individual-level initial values.")
+}
+
+if (length(best_angle_coef) < max(best_coef_index$angle_conc)) {
+  stop("best$mle$angle does not contain the expected coefficients for individual-level initial values.")
+}
+
+Par_best_ind <- list(
+  step = unname(c(
+    best_step_coef[best_coef_index$step_mean],
+    best_step_coef[best_coef_index$step_sd]
+  )),
+  angle = unname(best_angle_coef[best_coef_index$angle_conc])
+)
+
+
+
+ids <- unique(Data_HMM$id)
+
+n_try_ind <- HMM_SETTINGS$individual_random_starts
+
+model_by_id <- vector("list", length(ids))
+aic_by_id <- rep(NA_real_, length(ids))
+conv_by_id <- rep(FALSE, length(ids))
+n_by_id <- rep(NA_integer_, length(ids))
+best_run_by_id <- rep(NA_integer_, length(ids))
+n_success_by_id <- rep(0L, length(ids))
+id_model_attempts <- vector("list", length(ids))
+
+names(model_by_id) <- as.character(ids)
+names(id_model_attempts) <- as.character(ids)
+
+for(i in seq_along(ids)){
+  
+  id_i <- ids[i]
+  
+  dat_i <- Data_HMM %>%
+    dplyr::filter(id == id_i)
+  
+  n_by_id[i] <- nrow(dat_i)
+  
+  cat("\n============================\n")
+  cat("id:", as.character(id_i), "\n")
+  cat("n =", nrow(dat_i), "\n")
+  
+  model_list_i <- vector("list", n_try_ind)
+  aic_i <- rep(NA_real_, n_try_ind)
+  conv_i <- rep(FALSE, n_try_ind)
+  error_i <- rep(NA_character_, n_try_ind)
+  init_ind_list_i <- vector("list", n_try_ind)
+  
+  for(j in seq_len(n_try_ind)){
+    
+    if(j == 1){
+      Par0_ind_try <- Par_best_ind
+    } else {
+      Par0_ind_try <- jitter_Par0_state(Par_best_ind, prop = 0.2)
+    }
+    
+    init_ind_list_i[[j]] <- Par0_ind_try
+    
+    cat("individual model run", j, "/", n_try_ind, "\n")
+    
+    tryCatch({
+      
+      m_i <- momentuHMM::fitHMM(
+        data = dat_i,
+        nbStates = 4,
+        dist = dist_ind,
+        Par0 = Par0_ind_try,
+        DM = DM_ind,
+        formula = ~ 1,
+        estAngleMean = list(angle = FALSE),
+        stateNames = stateNames_ind
+      )
+      
+      model_list_i[[j]] <- m_i
+      aic_i[j] <- AIC(m_i)
+      conv_i[j] <- TRUE
+      
+      cat("AIC =", aic_i[j], "\n")
+      
+    }, error = function(e){
+      
+      cat("failed:", e$message, "\n")
+      conv_i[j] <<- FALSE
+      aic_i[j] <<- NA_real_
+      error_i[j] <<- e$message
+      
+    })
+  }
+  
+  id_model_attempts[[as.character(id_i)]] <- tibble::tibble(
+    id = as.character(id_i),
+    run = seq_len(n_try_ind),
+    AIC = aic_i,
+    converged = conv_i,
+    error = error_i
+  )
+  
+  valid_i <- which(conv_i & !is.na(aic_i))
+  n_success_by_id[i] <- length(valid_i)
+  
+  if(length(valid_i) > 0){
+    best_j <- valid_i[which.min(aic_i[valid_i])]
+    
+    model_by_id[[as.character(id_i)]] <- model_list_i[[best_j]]
+    aic_by_id[i] <- aic_i[best_j]
+    conv_by_id[i] <- TRUE
+    best_run_by_id[i] <- best_j
+    
+    cat("Best individual run:", best_j, "AIC =", aic_by_id[i], "\n")
+  } else {
+    cat("all individual HMM runs failed for id:", as.character(id_i), "\n")
+    conv_by_id[i] <- FALSE
+    aic_by_id[i] <- NA_real_
+  }
+}
+
+id_model_attempts <- dplyr::bind_rows(id_model_attempts)
+
+id_model_summary <- data.frame(
+  id = ids,
+  n = n_by_id,
+  best_run = best_run_by_id,
+  n_success = n_success_by_id,
+  AIC = aic_by_id,
+  converged = conv_by_id
+)
+
+id_model_summary
+```
+
+Viterbi state
+
+```{r}
+state_prop_by_id <- lapply(names(model_by_id), function(id_i){
+  
+  m_i <- model_by_id[[id_i]]
+  
+  if(is.null(m_i)) return(NULL)
+  
+  dat_i <- m_i$data %>% 
+    dplyr::mutate(
+      state = factor(
+        momentuHMM::viterbi(m_i),
+        levels = 1:4,
+        labels = stateNames_ind
+      )
+    )
+  
+  dat_i %>% 
+    dplyr::count(state) %>% 
+    dplyr::mutate(
+      id = id_i,
+      prop = n / sum(n)
+    ) %>% 
+    dplyr::select(id, state, n, prop)
+  
+}) %>% 
+  dplyr::bind_rows()
+
+print(state_prop_by_id)
+```
+
+Summary of individual-level HMM parameter estimates
+
+```{r}
+extract_ind_hmm_par <- function(m_i, id_i){
+  if(is.null(m_i)) return(NULL)
+  nbStates_i <- m_i$conditions$nbStates
+  
+  # step parameters
+  step_i <- m_i$mle$step
+  
+  if(is.matrix(step_i)){
+    step_mean_i <- step_i["mean", stateNames]
+    step_sd_i <- step_i["sd", stateNames]
+  } else {
+    step_mean_i <- step_i[1:nbStates_i]
+    step_sd_i <- step_i[(nbStates_i + 1):(2 * nbStates_i)]
+    names(step_mean_i) <- stateNames
+    names(step_sd_i) <- stateNames
+  }
+  
+  # angle concentration
+  angle_i <- m_i$mle$angle
+  
+  if(is.matrix(angle_i)){
+    angle_conc_i <- angle_i["concentration", stateNames]
+  } else {
+    if(length(angle_i) == 2 * nbStates_i){
+      angle_conc_i <- angle_i[seq(2, 2 * nbStates_i, by = 2)]
+    } else if(length(angle_i) == nbStates_i){
+      angle_conc_i <- angle_i
+    } else {
+      stop(paste0("Unexpected length of angle parameters for id ", id_i, ": ", length(angle_i)))
+    }
+    names(angle_conc_i) <- stateNames
+  }
+  
+  # self-transition probability
+  gamma_i <- momentuHMM::getTrProbs(m_i)
+  
+  if(length(dim(gamma_i)) == 3){
+    gamma_i <- gamma_i[, , 1]
+  }
+  
+  rownames(gamma_i) <- stateNames
+  colnames(gamma_i) <- stateNames
+  
+  # table
+  data.frame(
+    id = as.character(id_i),
+    
+    step_mean_directed = step_mean_i["directed"],
+    step_mean_undirected = step_mean_i["undirected"],
+    step_mean_ARS = step_mean_i["ARS"],
+    step_mean_water = step_mean_i["water"],
+    
+    step_sd_directed = step_sd_i["directed"],
+    step_sd_undirected = step_sd_i["undirected"],
+    step_sd_ARS = step_sd_i["ARS"],
+    step_sd_water = step_sd_i["water"],
+    
+    angle_conc_directed = angle_conc_i["directed"],
+    angle_conc_undirected = angle_conc_i["undirected"],
+    angle_conc_ARS = angle_conc_i["ARS"],
+    angle_conc_water = angle_conc_i["water"],
+    
+    self_p_directed = gamma_i["directed", "directed"],
+    self_p_undirected = gamma_i["undirected", "undirected"],
+    self_p_ARS = gamma_i["ARS", "ARS"],
+    self_p_water = gamma_i["water", "water"]
+  )
+}
+
+par_by_id <- lapply(names(model_by_id), function(id_i){
+  extract_ind_hmm_par(
+    m_i = model_by_id[[id_i]],
+    id_i = id_i
+  )
+}) %>%
+  dplyr::bind_rows()
+
+if (nrow(par_by_id) == 0) {
+  stop("No individual-level HMM models converged successfully.")
+}
+
+id_model_summary2 <- id_model_summary %>%
+  dplyr::mutate(id = as.character(id))
+
+par_by_id <- par_by_id %>%
+  dplyr::left_join(id_model_summary2, by = "id") %>%
+  dplyr::select(
+    id, n,
+    step_mean_directed,
+    step_mean_undirected,
+    step_mean_ARS,
+    step_mean_water,
+    step_sd_directed,
+    step_sd_undirected,
+    step_sd_ARS,
+    step_sd_water,
+    angle_conc_directed,
+    angle_conc_undirected,
+    angle_conc_ARS,
+    angle_conc_water,
+    self_p_directed,
+    self_p_undirected,
+    self_p_ARS,
+    self_p_water
+  )
+
+par_by_id
+```
+
+# Save fitted objects
+
+```{r}
+out_rds_dir <- dirname(HMM_PATHS$fitted_objects)
+dir.create(out_rds_dir, recursive = TRUE, showWarnings = FALSE)
+
+hmm_yg2_objects <- list(
+  score = score,
+  success_rate_by_id = success_rate_by_id,
+  nest = nest,
+  kab = kab,
+  b_sf = b_sf,
+  coast = coast,
+  data0 = data0,
+  data = data,
+  rawData = rawData,
+  crawl_results = crawl_results,
+  crawl_log = crawl_log,
+  df_crw_check = df_crw_check,
+  df_crw2_check = df_crw2_check,
+  df_crw = df_crw,
+  df_crw2 = df_crw2,
+  df_keep = df_keep,
+  df_sea = df_sea,
+  Data_pre = Data_pre,
+  Data_HMM = Data_HMM,
+  stateNames = stateNames,
+  stateNames_ind = stateNames_ind,
+  n_try = n_try,
+  n_try_ind = n_try_ind,
+  best = best,
+  model_list = model_list,
+  aic_values = aic_values,
+  conv = conv,
+  results_summary = results_summary,
+  param_table = param_table,
+  model_by_id = model_by_id,
+  id_model_attempts = id_model_attempts,
+  id_model_summary = id_model_summary,
+  state_prop_by_id = state_prop_by_id,
+  par_by_id = par_by_id
+)
+
+saveRDS(hmm_yg2_objects, HMM_PATHS$fitted_objects)
+cat("Saved fitted objects to:", HMM_PATHS$fitted_objects, "\n")
+```

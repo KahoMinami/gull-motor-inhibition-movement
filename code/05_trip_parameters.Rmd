@@ -1,0 +1,794 @@
+---
+title: "Trip-level movement analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(lubridate)
+library(here)
+library(geosphere)
+library(sf)
+library(scales)
+library(glmmTMB)
+library(broom.mixed)
+library(patchwork)
+library(colorspace)
+
+source(here::here("code", "_shared.R"))
+```
+
+```{r directories, include=FALSE}
+ensure_project_dirs()
+```
+
+```{r settings, include=FALSE}
+TRIP_PATHS <- list(
+  data = here::here("outputs", "trip_segmentation.csv"),
+  breakwater = here::here("rawdata", "Kab_4.gpkg"),
+  coastline = here::here("rawdata", "gadm41_JPN_shp", "gadm41_JPN_0.shp"),
+  figure = here::here("figure", "S4_trip_parameters_p.pdf")
+)
+
+SEA_TRIP_THRESHOLD <- 0.70
+SEA_TRIP_THRESHOLDS <- c(0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
+
+assert_input_files(unlist(TRIP_PATHS[c("data", "breakwater", "coastline")]))
+
+trip_figure_theme <- function() {
+  list(
+    ggplot2::theme_classic(),
+    ggplot2::theme(
+      axis.title.x = ggplot2::element_text(size = 19, margin = ggplot2::margin(t = 12)),
+      axis.title.y = ggplot2::element_text(size = 19, margin = ggplot2::margin(r = 12)),
+      axis.text = ggplot2::element_text(size = 16),
+      legend.position = "none",
+      axis.line = ggplot2::element_blank(),
+      panel.border = ggplot2::element_rect(
+        colour = "black",
+        fill = NA,
+        linewidth = 0.8
+      )
+    )
+  )
+}
+```
+
+# Data input
+
+```{r}
+trip_data <- read.csv(TRIP_PATHS$data)
+```
+
+Bird-level information
+
+```{r}
+bird_info <- tibble::tribble(
+  ~id, ~success_rate, ~sex, ~hatching_day,
+  "62206", 0.40, "M", "5/23",
+  "62207", 0.00, "F", "5/23",
+  "671", 0.60, "F", "5/20",
+  "675", 0.50, "F", "5/23",
+  "681", 0.40, "M", "5/19",
+  "683", 0.00, "M", "5/19",
+  "685", 0.38, "M", "5/19",
+  "ATK_29B_S1", 0.00, "M", "5/18",
+  "ATK_2B_S1", 0.40, "M", "5/18",
+  "ATK_6E_S1", 0.60, "F", "5/18",
+  "BTG_KAB_2025_9B01831_S1", 0.11, "F", "5/23",
+  "BTG_KAB_2025_9B03427_S1", 0.67, "F", "5/19",
+  "BTG_KAB_2025_9B40989_S2", 0.25, "F", "5/19"
+)
+```
+
+# Data processing
+
+Classify locations
+
+```{r}
+# Breakwater polygons
+kab <- sf::st_read(
+  TRIP_PATHS$breakwater,
+  layer = "kab4__kab",
+  quiet = TRUE
+) %>%
+  dplyr::mutate(
+    category = dplyr::if_else(!is.na(breakwater), "breakwater", NA_character_)
+  ) %>%
+  dplyr::filter(category == "breakwater") %>%
+  sf::st_make_valid()
+
+# Coastline polygon
+coast <- sf::st_read(
+  TRIP_PATHS$coastline,
+  quiet = TRUE
+) %>%
+  sf::st_make_valid()
+
+# GPS points
+trip_sf <- sf::st_as_sf(
+  trip_data,
+  coords = c("lon", "lat"),
+  crs = 4326
+)
+
+# Land/sea classification
+sf::sf_use_s2(TRUE)
+
+trip_located <- sf::st_join(
+  trip_sf,
+  coast,
+  left = TRUE
+) %>%
+  dplyr::mutate(
+    coast_location = dplyr::if_else(is.na(COUNTRY), "sea", "land")
+  )
+
+sf::sf_use_s2(FALSE)
+
+trip_located <- trip_located %>%
+  dplyr::mutate(
+    on_breakwater = lengths(sf::st_intersects(trip_located, kab)) > 0,
+    location = dplyr::if_else(on_breakwater, "land", coast_location)
+  ) %>%
+  dplyr::select(
+    -dplyr::any_of(c("GID_0", "COUNTRY", "coast_location"))
+  ) %>%
+  sf::st_drop_geometry()
+```
+
+Select trips with >= 70% sea locations
+
+```{r}
+sea_threshold <- SEA_TRIP_THRESHOLD
+
+trip_sea_summary <- trip_located %>%
+  dplyr::filter(
+    !is.na(Trip_ID),
+    !on_breakwater
+  ) %>%
+  dplyr::group_by(id, Trip_ID) %>%
+  dplyr::summarise(
+    n_points = dplyr::n(),
+    n_sea = sum(location == "sea", na.rm = TRUE),
+    prop_sea = n_sea / n_points,
+    .groups = "drop"
+  )
+
+sea_trip_keys <- trip_sea_summary %>%
+  dplyr::filter(prop_sea >= sea_threshold) %>%
+  dplyr::select(id, Trip_ID, prop_sea)
+```
+
+# GLMMs
+
+Calculate trip-level parameters
+
+```{r}
+build_trip_parameters <- function(trip_keys) {
+  trip_data %>%
+    dplyr::inner_join(
+      trip_keys,
+      by = c("id", "Trip_ID")
+    ) %>%
+    dplyr::arrange(id, Trip_ID, time) %>%
+    dplyr::group_by(id, Trip_ID) %>%
+    dplyr::mutate(
+      step_length_m = geosphere::distHaversine(
+        cbind(lon, lat),
+        cbind(dplyr::lag(lon), dplyr::lag(lat))
+      )
+    ) %>%
+    dplyr::summarise(
+      total_distance = sum(step_length_m, na.rm = TRUE) / 1000,
+      max_distance = max(Nest_Distance, na.rm = TRUE) / 1000,
+      trip_duration = sum(time_diff_sec, na.rm = TRUE) / 60,
+      Date = as.Date(min(time)),
+      year = dplyr::first(year),
+      logger = dplyr::first(logger),
+      prop_sea = dplyr::first(prop_sea),
+      .groups = "drop"
+    ) %>%
+    dplyr::left_join(bird_info, by = "id") %>%
+    dplyr::mutate(
+      hatching_day = paste0(
+        stringr::str_pad(
+          stringr::str_extract(hatching_day, "^\\d+"),
+          width = 2,
+          pad = "0"
+        ),
+        "-",
+        stringr::str_pad(
+          stringr::str_extract(hatching_day, "\\d+$"),
+          width = 2,
+          pad = "0"
+        )
+      ),
+      hatch_date = as.Date(paste0(year, "-", hatching_day)),
+      days_from_hatching = as.numeric(Date - hatch_date),
+      attachment_method = dplyr::case_when(
+        logger %in% c("Gipsy", "VHF") ~ "harness",
+        logger == "Axy" ~ "tesa",
+        TRUE ~ NA_character_
+      ),
+      id = factor(id),
+      sex = factor(sex),
+      logger = factor(logger),
+      attachment_method = factor(attachment_method),
+      Date = factor(Date)
+    ) %>%
+    dplyr::select(
+      id,
+      Trip_ID,
+      prop_sea,
+      Date,
+      year,
+      logger,
+      attachment_method,
+      sex,
+      success_rate,
+      days_from_hatching,
+      total_distance,
+      max_distance,
+      trip_duration
+    )
+}
+
+data_para <- build_trip_parameters(sea_trip_keys)
+
+data_para
+```
+
+Fit trip-level GLMMs
+
+```{r}
+fit_trip_model <- function(df, response_var) {
+  
+  df_model <- df %>%
+    dplyr::mutate(
+      response_value = .data[[response_var]]
+    ) %>%
+    dplyr::filter(
+      !is.na(response_value),
+      response_value > 0,
+      !is.na(success_rate),
+      !is.na(days_from_hatching),
+      !is.na(sex),
+      !is.na(id),
+      !is.na(Date)
+    )
+  
+  formula_model <- stats::as.formula(
+    paste0(
+      "response_value ~ success_rate + days_from_hatching + sex + ",
+      "(1 | id) + (1 | Date)"
+    )
+  )
+  
+  glmmTMB::glmmTMB(
+    formula_model,
+    data = df_model,
+    family = glmmTMB::lognormal(link = "log")
+  )
+}
+
+response_vars <- c(
+  "total_distance",
+  "max_distance",
+  "trip_duration"
+)
+
+count_model_data <- function(df, response_var) {
+  
+  df %>%
+    dplyr::mutate(
+      response_value = .data[[response_var]]
+    ) %>%
+    dplyr::filter(
+      !is.na(response_value),
+      response_value > 0,
+      !is.na(success_rate),
+      !is.na(days_from_hatching),
+      !is.na(sex),
+      !is.na(id),
+      !is.na(Date)
+    )
+}
+
+model_results <- tibble::tibble(
+  response_var = response_vars
+) %>%
+  dplyr::mutate(
+    model_data = purrr::map(
+      response_var,
+      \(rv) count_model_data(data_para, rv)
+    ),
+    model = purrr::map(
+      response_var,
+      \(rv) fit_trip_model(data_para, rv)
+    ),
+    n_trips = purrr::map_int(
+      model_data,
+      nrow
+    ),
+    n_ids = purrr::map_int(
+      model_data,
+      \(df) dplyr::n_distinct(df$id)
+    ),
+    converged = purrr::map_lgl(
+      model,
+      \(m) isTRUE(m$sdr$pdHess)
+    ),
+    AIC = purrr::map_dbl(
+      model,
+      AIC
+    )
+  )
+
+model_results
+```
+
+Model Summaries
+
+```{r}
+model_results %>%
+  dplyr::select(response_var, n_trips, n_ids, AIC, converged, model) %>%
+  purrr::pwalk(function(response_var, n_trips, n_ids, AIC, converged, model) {
+    
+    cat("\n\n")
+    cat("============================================================\n")
+    cat("Response variable:", response_var, "\n")
+    cat("n trips          :", n_trips, "\n")
+    cat("============================================================\n\n")
+    
+    print(summary(model))
+  })
+```
+
+### Figure S4: Trip-level parameters by success rate
+
+```{r}
+y_vars <- c(
+  "total_distance",
+  "max_distance",
+  "trip_duration"
+)
+
+y_labels <- c(
+  total_distance = "Total distance (km)",
+  max_distance = "Maximum distance (km)",
+  trip_duration = "Trip duration (min)"
+)
+
+data_summary_all <- purrr::map_dfr(y_vars, function(y) {
+  
+  data_para %>%
+    dplyr::group_by(id, success_rate) %>%
+    dplyr::summarise(
+      mean_y = mean(.data[[y]], na.rm = TRUE),
+      sd_y = sd(.data[[y]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      variable = y
+    )
+})
+
+id_levels <- levels(data_para$id)
+
+id_cols <- setNames(
+  colorspace::qualitative_hcl(
+    length(id_levels),
+    palette = "Dark 3"
+  ),
+  id_levels
+)
+
+plot_list <- purrr::imap(y_vars, function(y, i) {
+  
+  data_summary <- data_summary_all %>%
+    dplyr::filter(variable == y)
+  
+  x_label <- if (i == length(y_vars)) "Success rate" else NULL
+  
+  ggplot() +
+    geom_jitter(
+      data = data_para,
+      aes(
+        x = success_rate,
+        y = .data[[y]],
+        colour = id
+      ),
+      alpha = 0.5,
+      size = 1.5,
+      width = 0.02,
+      height = 0
+    ) +
+    geom_errorbar(
+      data = data_summary,
+      aes(
+        x = success_rate,
+        ymin = mean_y - sd_y,
+        ymax = mean_y + sd_y,
+        colour = id
+      ),
+      width = 0.05,
+      linewidth = 0.8
+    ) +
+    geom_point(
+      data = data_summary,
+      aes(
+        x = success_rate,
+        y = mean_y,
+        colour = id
+      ),
+      size = 4
+    ) +
+    scale_colour_manual(values = id_cols) +
+    trip_figure_theme() +
+    labs(
+      x = x_label,
+      y = y_labels[y]
+    )
+})
+
+fig_s3 <- patchwork::wrap_plots(
+  plot_list,
+  ncol = 1
+)
+
+fig_s3
+
+save_pdf(
+  filename = TRIP_PATHS$figure,
+  plot = fig_s3,
+  size = FIGURE_SIZES$trip_parameters
+)
+```
+
+
+
+
+
+# Data check
+
+GPS data collection days per individual
+
+```{r}
+# ------------------------------------------------------------
+# GPS tracking duration per individual
+# ------------------------------------------------------------
+
+gps_days_by_id <- trip_data %>%
+  dplyr::mutate(
+    Date = as.Date(time)
+  ) %>%
+  dplyr::group_by(id) %>%
+  dplyr::summarise(
+    first_date = min(Date, na.rm = TRUE),
+    last_date = max(Date, na.rm = TRUE),
+    gps_days = as.numeric(last_date - first_date) + 1,
+    .groups = "drop"
+  )
+
+gps_days_by_id
+
+
+gps_days_summary <- gps_days_by_id %>%
+  dplyr::summarise(
+    n_individuals = dplyr::n_distinct(id),
+    mean_days = mean(gps_days, na.rm = TRUE),
+    min_days = min(gps_days, na.rm = TRUE),
+    max_days = max(gps_days, na.rm = TRUE),
+    sd_days = sd(gps_days, na.rm = TRUE)
+  )
+
+gps_days_summary
+```
+Total number of trips and trips per individual
+
+```{r}
+all_trip_keys <- trip_data %>%
+  dplyr::filter(!is.na(Trip_ID)) %>%
+  dplyr::distinct(id, Trip_ID)
+
+n_all_trips <- nrow(all_trip_keys)
+
+n_all_trips
+
+
+trips_by_id <- all_trip_keys %>%
+  dplyr::count(id, name = "n_trips")
+
+trips_by_id
+
+
+trips_summary <- trips_by_id %>%
+  dplyr::summarise(
+    n_individuals = dplyr::n_distinct(id),
+    total_trips = sum(n_trips, na.rm = TRUE),
+    mean_trips = mean(n_trips, na.rm = TRUE),
+    min_trips = min(n_trips, na.rm = TRUE),
+    max_trips = max(n_trips, na.rm = TRUE),
+    sd_trips = sd(n_trips, na.rm = TRUE)
+  )
+
+trips_summary
+```
+
+Number and percentage of sea trips
+
+```{r}
+sea_trip_keys_80 <- sea_trip_keys %>%
+  dplyr::distinct(id, Trip_ID)
+
+n_sea_trips <- nrow(sea_trip_keys_80)
+
+percent_sea_trips <- n_sea_trips / n_all_trips * 100
+
+n_sea_trips
+percent_sea_trips
+
+
+
+sea_trip_summary <- tibble::tibble(
+  n_all_trips = n_all_trips,
+  n_sea_trips = n_sea_trips,
+  percent_sea_trips = percent_sea_trips
+)
+
+sea_trip_summary
+```
+Number of sea trips per individual
+
+```{r}
+sea_trips_by_id <- bird_info %>%
+  dplyr::select(id) %>%
+  dplyr::left_join(
+    sea_trip_keys_80 %>%
+      dplyr::count(id, name = "n_sea_trips"),
+    by = "id"
+  ) %>%
+  dplyr::mutate(
+    n_sea_trips = tidyr::replace_na(n_sea_trips, 0L)
+  )
+
+sea_trips_by_id
+
+sea_trips_by_id_summary <- sea_trips_by_id %>%
+  dplyr::summarise(
+    n_individuals = dplyr::n_distinct(id),
+    mean_sea_trips = mean(n_sea_trips, na.rm = TRUE),
+    min_sea_trips = min(n_sea_trips, na.rm = TRUE),
+    max_sea_trips = max(n_sea_trips, na.rm = TRUE),
+    sd_sea_trips = sd(n_sea_trips, na.rm = TRUE)
+  )
+
+sea_trips_by_id_summary
+```
+
+### Sensitivity analysis for sea-trip threshold
+
+```{r}
+# ============================================================
+# 70, 75, 80, 85, 90, and 95%
+# Extract success-rate effects from the same GLMM structure
+# ============================================================
+
+sea_thresholds <- SEA_TRIP_THRESHOLDS
+
+response_vars <- c(
+  "total_distance",
+  "max_distance",
+  "trip_duration"
+)
+
+response_labels <- c(
+  total_distance = "Total distance",
+  max_distance   = "Maximum distance",
+  trip_duration  = "Trip duration"
+)
+
+# ------------------------------------------------------------
+# Function to create trip-level data for one sea-fix threshold
+# ------------------------------------------------------------
+
+make_trip_data_threshold <- function(threshold) {
+  sea_trip_keys_threshold <- trip_sea_summary %>%
+    dplyr::filter(prop_sea >= threshold) %>%
+    dplyr::select(id, Trip_ID, prop_sea)
+
+  build_trip_parameters(sea_trip_keys_threshold)
+}
+
+# ------------------------------------------------------------
+# Function to fit one GLMM and extract success-rate statistics
+# ------------------------------------------------------------
+
+fit_extract_success <- function(df, response_var) {
+
+  df_model <- df %>%
+    dplyr::mutate(
+      response_value = .data[[response_var]]
+    ) %>%
+    dplyr::filter(
+      !is.na(response_value),
+      response_value > 0,
+      !is.na(success_rate),
+      !is.na(days_from_hatching),
+      !is.na(sex),
+      !is.na(id),
+      !is.na(Date)
+    )
+
+  formula_model <-
+    response_value ~
+      success_rate +
+      days_from_hatching +
+      sex +
+      (1 | id) +
+      (1 | Date)
+
+  # First fit the model with the default nlminb optimizer
+  model_nlminb <- glmmTMB::glmmTMB(
+    formula_model,
+    data = df_model,
+    family = glmmTMB::lognormal(link = "log"),
+    control = glmmTMB::glmmTMBControl(
+      optimizer = stats::nlminb
+    )
+  )
+
+  coef_nlminb <- summary(model_nlminb)$coefficients$cond
+  se_nlminb <- unname(coef_nlminb["success_rate", "Std. Error"])
+
+  # Keep the nlminb fit when standard errors are available
+  if (is.finite(se_nlminb)) {
+
+    model <- model_nlminb
+    optimizer_used <- "nlminb"
+
+  } else {
+
+    # Refit with BFGS when standard errors are unavailable
+    model_bfgs <- glmmTMB::glmmTMB(
+      formula_model,
+      data = df_model,
+      family = glmmTMB::lognormal(link = "log"),
+      control = glmmTMB::glmmTMBControl(
+        optimizer = stats::optim,
+        optArgs = list(method = "BFGS")
+      )
+    )
+
+    coef_bfgs <- summary(model_bfgs)$coefficients$cond
+    se_bfgs <- unname(coef_bfgs["success_rate", "Std. Error"])
+
+    model <- model_bfgs
+    optimizer_used <- "BFGS"
+  }
+
+  coef_table <- summary(model)$coefficients$cond
+  success_row <- coef_table["success_rate", ]
+
+  tibble::tibble(
+    n_trips = nrow(df_model),
+    n_ids = dplyr::n_distinct(df_model$id),
+    n_dates = dplyr::n_distinct(df_model$Date),
+    beta = unname(success_row["Estimate"]),
+    SE = unname(success_row["Std. Error"]),
+    z = unname(success_row["z value"]),
+    p = unname(success_row["Pr(>|z|)"]),
+    pdHess = isTRUE(model$sdr$pdHess),
+    convergence_code = model$fit$convergence,
+    convergence_message = model$fit$message,
+    optimizer = optimizer_used,
+    model = list(model)
+  )
+}
+
+# ------------------------------------------------------------
+# Run all thresholds and response variables
+# ------------------------------------------------------------
+
+sensitivity_results <- tidyr::crossing(
+  threshold = sea_thresholds,
+  response_var = response_vars
+) %>%
+  dplyr::mutate(
+    threshold_data = purrr::map(
+      threshold,
+      make_trip_data_threshold
+    ),
+    result = purrr::map2(
+      threshold_data,
+      response_var,
+      fit_extract_success
+    )
+  ) %>%
+  dplyr::select(
+    threshold,
+    response_var,
+    result
+  ) %>%
+  tidyr::unnest(result) %>%
+  dplyr::mutate(
+    response_variable = unname(response_labels[response_var]),
+    threshold_percent = threshold * 100,
+    response_variable = factor(
+      response_variable,
+      levels = c(
+        "Total distance",
+        "Maximum distance",
+        "Trip duration"
+      )
+    )
+  ) %>%
+  dplyr::arrange(
+    response_variable,
+    threshold_percent
+  )
+
+# Inspect models with convergence problems
+problem_models <- sensitivity_results %>%
+  dplyr::filter(
+    !is.finite(SE) |
+      !pdHess |
+      convergence_code != 0
+  ) %>%
+  dplyr::select(
+    response_variable,
+    threshold_percent,
+    beta,
+    SE,
+    p,
+    optimizer,
+    pdHess,
+    convergence_code,
+    convergence_message
+  )
+
+problem_models
+
+# ------------------------------------------------------------
+# Format table for the Supplementary Materials
+# ------------------------------------------------------------
+
+sensitivity_table <- sensitivity_results %>%
+  dplyr::mutate(
+    beta = sprintf("%.2f", beta),
+    SE = sprintf("%.2f", SE),
+    z = sprintf("%.2f", z),
+    p = dplyr::case_when(
+      p < 0.001 ~ "< 0.001",
+      TRUE ~ sprintf("%.2f", p)
+    )
+  ) %>%
+  dplyr::select(
+  `Response variable` = response_variable,
+  `Threshold (%)` = threshold_percent,
+  `n trips` = n_trips,
+  `β` = beta,
+  `SE` = SE,
+  `z` = z,
+  `p` = p
+) %>%
+  dplyr::group_by(`Response variable`) %>%
+  dplyr::mutate(
+    `Response variable` = as.character(`Response variable`),
+    `Response variable` = dplyr::if_else(
+      dplyr::row_number() == 1,
+      `Response variable`,
+      ""
+    )
+  ) %>%
+  dplyr::ungroup()
+
+sensitivity_table
+```

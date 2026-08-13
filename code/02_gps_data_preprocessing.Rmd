@@ -1,0 +1,426 @@
+---
+title: "GPS data preprocessing"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(lubridate)
+library(here)
+library(geosphere)
+library(SDLfilter)
+
+source(here::here("code", "_shared.R"))
+ensure_project_dirs()
+```
+
+# Settings and helper functions
+
+```{r settings, include=FALSE}
+OUTPUT_PATHS <- c(
+  gps_combined = here::here("outputs", "GPS_combined.csv"),
+  gps_filtered = here::here("outputs", "filtered.csv"),
+  gps_resampled = here::here("outputs", "resampling.csv"),
+  trip_segmentation = here::here("outputs", "trip_segmentation.csv")
+)
+
+LOGGER_PATHS <- list(
+  axy = c(
+    "2024" = here::here("rawdata", "2024_Axy"),
+    "2025" = here::here("rawdata", "2025_Axy")
+  ),
+  vhf = here::here("rawdata", "2025_VHF"),
+  gipsy = here::here("rawdata", "2025_Gipsy")
+)
+
+GPS_FILTER <- list(
+  max_speed_kmh = 90,
+  qi = 4,
+  inner_angle_deg = 90,
+  method = 2,
+  lat_range = c(38, 42),
+  lon_range = c(140, 145)
+)
+
+TRIP_RULE <- list(
+  nest = unname(NEST_COORDS),
+  distance_m = 1000,
+  duration_s = 60 * 60
+)
+
+write_csv_jst <- function(data, path) {
+  data %>%
+    dplyr::mutate(
+      time = format(
+        lubridate::with_tz(time, LOCAL_TZ),
+        format = "%Y-%m-%d %H:%M:%S",
+        tz = LOCAL_TZ
+      )
+    ) %>%
+    readr::write_csv(path)
+}
+
+parse_axy_time <- function(date, time) {
+  timestamp <- paste(date, time)
+  formats <- c(
+    "%d/%m/%Y %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S"
+  )
+
+  parsed <- strptime(timestamp, formats[[1]], tz = "UTC")
+  for (format_i in formats[-1]) {
+    if (!all(is.na(parsed))) break
+    parsed <- strptime(timestamp, format_i, tz = "UTC")
+  }
+
+  lubridate::with_tz(as.POSIXct(parsed), LOCAL_TZ)
+}
+
+read_axy_file <- function(file, year) {
+  data <- readr::read_table(
+    file,
+    col_names = FALSE,
+    skip_empty_rows = FALSE,
+    col_types = readr::cols(
+      X1 = "c",
+      X2 = "c",
+      X3 = "n",
+      X4 = "n"
+    )
+  ) %>%
+    tibble::as_tibble() %>%
+    dplyr::select(X1:X4)
+
+  tibble::tibble(
+    time = parse_axy_time(data$X1, data$X2),
+    lon = data$X4,
+    lat = data$X3,
+    id = tools::file_path_sans_ext(basename(file)),
+    year = as.numeric(year),
+    logger = "Axy"
+  )
+}
+
+read_vhf_file <- function(file) {
+  data <- readr::read_table(
+    file,
+    col_names = FALSE,
+    skip = 1,
+    col_types = readr::cols(
+      X4 = "c",
+      X5 = "c",
+      X9 = "n",
+      X10 = "n"
+    )
+  ) %>%
+    tibble::as_tibble() %>%
+    dplyr::select(X4, X5, X9, X10)
+
+  tibble::tibble(
+    time = strptime(
+      paste(data$X4, data$X5),
+      "%y/%m/%d %H:%M:%S",
+      tz = "UTC"
+    ) %>%
+      as.POSIXct() %>%
+      lubridate::with_tz(LOCAL_TZ),
+    lon = data$X10,
+    lat = data$X9,
+    id = tools::file_path_sans_ext(basename(file)),
+    year = 2025,
+    logger = "VHF"
+  )
+}
+
+read_gipsy_file <- function(file) {
+  read.table(
+    file,
+    sep = "",
+    header = TRUE,
+    fill = TRUE
+  )[, 1:6]
+}
+
+rle_sections <- function(x) {
+  encoded <- rle(x)
+  ends <- cumsum(encoded$lengths)
+
+  data.frame(
+    value = encoded$values,
+    length = encoded$lengths,
+    start = ends - encoded$lengths + 1,
+    stop = ends
+  )
+}
+
+assign_trip_ids <- function(data, distance_m, duration_s) {
+  nest_out <- as.numeric(data$Nest_Distance > distance_m)
+  candidate <- rle_sections(nest_out) %>%
+    dplyr::filter(value == 1)
+
+  trip_id <- rep(0, nrow(data))
+  if (nrow(candidate) == 0) return(trip_id)
+
+  duration <- as.numeric(
+    difftime(
+      data$time[candidate$stop],
+      data$time[candidate$start],
+      units = "secs"
+    )
+  )
+  trips <- candidate[duration > duration_s, ]
+  if (nrow(trips) == 0) return(trip_id)
+
+  # A run that reaches the final GPS fix has no observed return to the nest.
+  if (trips$stop[nrow(trips)] == nrow(data)) {
+    trips <- trips[-nrow(trips), , drop = FALSE]
+  }
+  if (nrow(trips) == 0) return(trip_id)
+
+  for (j in seq_len(nrow(trips))) {
+    trip_id[trips$start[j]:trips$stop[j]] <- j
+  }
+  trip_id
+}
+```
+
+# Data input
+
+## Axy-Trek
+
+```{r read-axy}
+axy_all <- purrr::imap_dfr(LOGGER_PATHS$axy, function(directory, year) {
+  files <- list.files(
+    path = directory,
+    pattern = "\\.txt$",
+    full.names = TRUE
+  )
+  purrr::map_dfr(files, read_axy_file, year = year)
+}) %>%
+  tidyr::drop_na() %>%
+  dplyr::arrange(id, time)
+```
+
+## PinPoint VHF
+
+```{r read-vhf}
+vhf_all <- list.files(
+  path = LOGGER_PATHS$vhf,
+  pattern = "\\.txt$",
+  full.names = TRUE
+) %>%
+  purrr::map_dfr(read_vhf_file) %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(
+    # Equivalent to 2025-06-01 00:00:00 UTC.
+    time < as.POSIXct("2025-06-01 09:00:00", tz = LOCAL_TZ)
+  )
+```
+
+## Gipsy Remote
+
+```{r read-gipsy}
+gipsy_all <- list.files(
+  path = LOGGER_PATHS$gipsy,
+  pattern = "\\.txt$",
+  full.names = TRUE
+) %>%
+  purrr::map_dfr(read_gipsy_file) %>%
+  dplyr::filter(!grepl("^([^/]*?/){2}[^/]*$", Name)) %>%
+  dplyr::mutate(
+    time = as.POSIXct(
+      paste(address, Timestamp),
+      format = "%d/%m/%Y %H:%M:%S",
+      tz = "UTC"
+    ) %>%
+      lubridate::with_tz(LOCAL_TZ)
+  ) %>%
+  dplyr::filter(
+    time >= as.POSIXct("2025-05-12 10:00:00", tz = LOCAL_TZ),
+    time <= as.POSIXct("2025-05-29 07:30:00", tz = LOCAL_TZ),
+    as.numeric(Latitude) > 38,
+    as.numeric(Latitude) < 42
+  ) %>%
+  dplyr::transmute(
+    time,
+    lon = as.numeric(Longitude),
+    lat = as.numeric(Latitude),
+    id = Name,
+    year = 2025,
+    logger = "Gipsy"
+  )
+```
+
+## Combine logger types
+
+```{r combine-loggers}
+data_all <- dplyr::bind_rows(axy_all, vhf_all, gipsy_all) %>%
+  dplyr::arrange(id, time)
+
+write_csv_jst(data_all, OUTPUT_PATHS[["gps_combined"]])
+```
+
+# Outlier removal
+
+```{r outlier-removal}
+data_all_clean <- data_all %>%
+  dplyr::filter(
+    lat >= GPS_FILTER$lat_range[[1]],
+    lat <= GPS_FILTER$lat_range[[2]],
+    lon >= GPS_FILTER$lon_range[[1]],
+    lon <= GPS_FILTER$lon_range[[2]]
+  ) %>%
+  dplyr::mutate(
+    Time = lubridate::with_tz(time, LOCAL_TZ),
+    qi = 10
+  ) %>%
+  dplyr::rename(DateTime = time) %>%
+  as.data.frame()
+
+data_filtered <- SDLfilter::ddfilter(
+  data_all_clean,
+  vmax = GPS_FILTER$max_speed_kmh,
+  qi = GPS_FILTER$qi,
+  ia = GPS_FILTER$inner_angle_deg,
+  method = GPS_FILTER$method
+)
+
+cat("Removed", nrow(data_all_clean) - nrow(data_filtered), "points\n")
+
+data_filtered <- as.data.frame(data_filtered) %>%
+  dplyr::rename(time = DateTime) %>%
+  dplyr::select(time, lon, lat, id, year, logger)
+
+summary(data_filtered[, c("lat", "lon")])
+head(data_filtered)
+
+write_csv_jst(data_filtered, OUTPUT_PATHS[["gps_filtered"]])
+```
+
+# Deployment-period filtering
+
+```{r deployment-periods}
+data_filtered <- data_filtered %>%
+  dplyr::mutate(time = lubridate::with_tz(as.POSIXct(time), LOCAL_TZ))
+
+periods <- list(
+  "62206" = c("2025-05-11 14:55:00", "2025-06-01 00:00:00"),
+  "62207" = c("2025-05-11 15:26:00", "2025-06-01 00:00:00"),
+  "671" = c("2025-05-12 09:28:00", "2025-05-23 09:53:00"),
+  "675" = c("2025-05-14 10:07:00", "2025-06-01 00:00:00"),
+  "681" = c("2025-05-16 10:39:00", "2025-06-01 00:00:00"),
+  "683" = c("2025-05-14 14:48:00", "2025-06-01 00:00:00"),
+  "685" = c("2025-05-14 15:51:00", "2025-05-26 15:15:00"),
+  "BTG_KAB_2025_9B01831_S1" = c("2025-05-11 10:35:00", "2025-05-19 11:37:00"),
+  "BTG_KAB_2025_9B03427_S1" = c("2025-05-09 14:07:00", "2025-05-19 11:22:00"),
+  "BTG_KAB_2025_9B40989_S2" = c("2025-05-09 14:50:00", "2025-05-23 09:35:00"),
+  "ATK_29B_S1" = c("2024-05-09 14:40:00", "2024-05-14 14:52:00"),
+  "ATK_2B_S1" = c("2024-05-09 13:57:00", "2024-05-15 10:12:00"),
+  "ATK_6E_S1" = c("2024-05-09 13:19:00", "2024-05-15 10:47:00")
+)
+
+df_all_filter <- dplyr::bind_rows(lapply(names(periods), function(id_i) {
+  period <- periods[[id_i]]
+  start_jst <- as.POSIXct(period[[1]], tz = LOCAL_TZ)
+  end_jst <- as.POSIXct(period[[2]], tz = LOCAL_TZ)
+
+  if (is.na(start_jst) || is.na(end_jst)) return(NULL)
+
+  data_filtered %>%
+    dplyr::filter(
+      id == id_i,
+      time >= start_jst,
+      time <= end_jst
+    )
+}))
+```
+
+# Five-minute resampling
+
+```{r resampling}
+df_all_5min <- df_all_filter %>%
+  dplyr::mutate(time_5min = lubridate::floor_date(time, unit = "5 minutes"))
+
+df_all_filter <- df_all_filter %>%
+  dplyr::arrange(id, time) %>%
+  dplyr::group_by(id) %>%
+  dplyr::mutate(
+    time_diff_sec = as.numeric(difftime(time, dplyr::lag(time), units = "secs"))
+  ) %>%
+  dplyr::ungroup()
+
+df_all_thinned <- df_all_5min %>%
+  dplyr::arrange(id, time_5min, time) %>%
+  dplyr::group_by(id, time_5min) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+df_all_thin <- df_all_thinned %>%
+  dplyr::mutate(time = time_5min) %>%
+  dplyr::select(-time_5min) %>%
+  dplyr::arrange(id, time) %>%
+  dplyr::group_by(id) %>%
+  dplyr::mutate(
+    time_diff_sec = as.numeric(difftime(time, dplyr::lag(time), units = "secs"))
+  ) %>%
+  dplyr::ungroup()
+
+df_all_thin %>%
+  dplyr::group_by(id) %>%
+  dplyr::summarise(
+    mean_time_diff_sec = mean(time_diff_sec, na.rm = TRUE),
+    sd = stats::sd(time_diff_sec, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv_jst(df_all_thin, OUTPUT_PATHS[["gps_resampled"]])
+```
+
+# Trip segmentation
+
+```{r trip-segmentation}
+data_out_all <- df_all_thin %>%
+  dplyr::group_by(id) %>%
+  dplyr::arrange(time, .by_group = TRUE) %>%
+  dplyr::mutate(
+    Nest_Distance = geosphere::distGeo(
+      matrix(TRIP_RULE$nest, nrow = dplyr::n(), ncol = 2, byrow = TRUE),
+      cbind(lon, lat)
+    )
+  ) %>%
+  dplyr::ungroup()
+
+out_data <- tibble::tibble()
+
+for (id_i in unique(data_out_all$id)) {
+  data <- data_out_all %>%
+    dplyr::filter(id == id_i)
+
+  data$Trip_ID <- assign_trip_ids(
+    data,
+    distance_m = TRIP_RULE$distance_m,
+    duration_s = TRIP_RULE$duration_s
+  )
+
+  out_data <- dplyr::bind_rows(out_data, data)
+}
+
+out_data_clean <- out_data %>%
+  dplyr::filter(Trip_ID != 0)
+
+out_data_clean %>%
+  dplyr::group_by(id) %>%
+  dplyr::summarise(
+    n_trip = dplyr::n_distinct(Trip_ID),
+    .groups = "drop"
+  )
+
+write_csv_jst(out_data_clean, OUTPUT_PATHS[["trip_segmentation"]])
+```

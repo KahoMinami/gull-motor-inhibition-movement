@@ -1,0 +1,1667 @@
+---
+title: "HMM figures and post-hoc analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(zoo)
+library(here)
+library(purrr)
+library(scales)
+library(ggforce)
+library(ggspatial)
+library(patchwork)
+library(cowplot)
+library(knitr)
+library(kableExtra)
+library(sf)
+library(sp)
+library(geosphere)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rosm)
+library(raster)
+library(ggeffects)
+library(splines)
+library(momentuHMM)
+library(glmmTMB)
+library(betareg)
+library(broom)
+
+source(here::here("code", "_shared.R"))
+```
+
+```{r directories, include=FALSE}
+ensure_project_dirs()
+```
+
+# 04: figures and post-HMM analyses
+
+Create figures and post-hoc analyses from the HMM results saved by '03_HMM_fit_and_save.Rmd'.
+
+# Load fitted HMM objects
+
+```{r}
+fit_rds <- here::here("outputs", "03_HMM", "03_fit_objects.rds")
+
+if (!file.exists(fit_rds)) {
+  stop("03_fit_objects.rds was not found. Please run the HMM fitting and saving script first.")
+}
+
+hmm_yg2_objects <- readRDS(fit_rds)
+list2env(hmm_yg2_objects, envir = .GlobalEnv)
+
+hmm_step_minutes <- Data_HMM %>%
+  dplyr::mutate(id = as.character(id)) %>%
+  dplyr::arrange(id, time) %>%
+  dplyr::group_by(id) %>%
+  dplyr::mutate(dt_min = as.numeric(difftime(time, dplyr::lag(time), units = "mins"))) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(is.finite(dt_min), dt_min > 0) %>%
+  dplyr::summarise(step_minutes = stats::median(dt_min, na.rm = TRUE)) %>%
+  dplyr::pull(step_minutes)
+
+calc_dwell_time_min <- function(self_transition_prob, step_minutes = hmm_step_minutes){
+  ifelse(
+    is.na(self_transition_prob) | self_transition_prob < 0 | self_transition_prob >= 1,
+    NA_real_,
+    step_minutes / (1 - self_transition_prob)
+  )
+}
+```
+
+### Figure S1: State-dependent HMM parameter
+
+Distribution plot
+
+```{r}
+bg_step <- Data_HMM %>%
+  dplyr::select(step) %>%
+  dplyr::filter(!is.na(step))
+
+bg_angle <- Data_HMM %>%
+  dplyr::select(angle) %>%
+  dplyr::filter(!is.na(angle))
+
+get_params <- function(model){
+  step_beta <- unlist(model$mle$step)
+  angle_beta <- unlist(model$mle$angle)
+  
+  data.frame(
+    state = stateNames,
+    step_mean = c(
+      exp(step_beta[1]),
+      exp(step_beta[3]),
+      exp(step_beta[5]),
+      exp(step_beta[6])
+    ),
+    step_sd = exp(step_beta[7:10]),
+    angle_conc = c(
+      exp(angle_beta[1]),
+      exp(angle_beta[3]),
+      exp(angle_beta[5]),
+      exp(angle_beta[6])
+    )
+  )
+}
+
+calc_densities <- function(param_table, max_step = 6000, n = 500){
+  step_x <- seq(0, max_step, length.out = n)
+  angle_x <- seq(-pi, pi, length.out = n)
+  
+  step_dens <- purrr::map_dfr(seq_len(nrow(param_table)), function(i){
+    p <- param_table[i, ]
+    shape <- p$step_mean^2 / p$step_sd^2
+    scale <- p$step_sd^2 / p$step_mean
+    
+    data.frame(
+      x = step_x,
+      density = dgamma(step_x, shape = shape, scale = scale),
+      state = p$state
+    )
+  })
+  
+  angle_dens <- purrr::map_dfr(seq_len(nrow(param_table)), function(i){
+    p <- param_table[i, ]
+    d_angle <- if(p$angle_conc < 1e-8){
+      rep(1 / (2 * pi), length(angle_x))
+    } else {
+      exp(p$angle_conc * cos(angle_x)) / (2 * pi * besselI(p$angle_conc, 0))
+    }
+    
+    data.frame(
+      x = angle_x,
+      density = d_angle,
+      state = p$state
+    )
+  })
+  
+  list(step = step_dens, angle = angle_dens)
+}
+
+cols <- HMM_STATE_COLOURS
+state_labels <- HMM_STATE_LABELS
+
+param_table <- get_params(best)
+dens <- calc_densities(param_table, max_step = 6100)
+
+draw_order <- c("water", "ARS", "undirected", "directed")
+
+dens_step <- dens$step %>%
+  dplyr::mutate(state = factor(state, levels = draw_order)) %>%
+  dplyr::arrange(state)
+
+dens_angle <- dens$angle %>%
+  dplyr::mutate(state = factor(state, levels = draw_order)) %>%
+  dplyr::arrange(state)
+
+p_step <- ggplot() +
+  geom_histogram(data = bg_step, aes(x = step, y = after_stat(density)), bins = 70, fill = "grey80", color = NA) +
+  geom_line(data = dens_step, aes(x = x, y = density, colour = state), linewidth = 1) +
+  scale_colour_manual(values = cols, breaks = stateNames, labels = state_labels) +
+  coord_cartesian(xlim = c(0, 6100)) +
+  labs(x = "Step length (m)", y = "Density", colour = NULL) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 20, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 20, margin = margin(r = 12)),
+    axis.text = element_text(size = 18),
+    legend.title = element_blank(),
+    axis.line = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    plot.margin = margin(t = 5, r = 3, b = 5, l = 5)
+  )
+
+p_angle <- ggplot() +
+  geom_histogram(data = bg_angle, aes(x = angle, y = after_stat(density)), bins = 35, fill = "grey80", color = NA) +
+  geom_line(data = dens_angle, aes(x = x, y = density, colour = state), linewidth = 1) +
+  scale_colour_manual(values = cols, breaks = stateNames, labels = state_labels) +
+  scale_x_continuous(breaks = c(-pi, -pi / 2, 0, pi / 2, pi), labels = c(expression(-pi), expression(-pi/2), "0", expression(pi/2), expression(pi))) +
+  labs(x = "Turning angle (radians)", y = "", colour = NULL) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 20, margin = margin(t = 10)),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 18),
+    axis.text.y = element_text(size = 18),
+    axis.ticks.y = element_line(),
+    axis.line = element_blank(),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 18),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 3)
+  )
+
+legend_dist <- cowplot::get_legend(
+  p_angle +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 18)
+    ) +
+    guides(
+      colour = guide_legend(title = NULL, nrow = 1)
+    )
+)
+
+p_step_noleg <- p_step + theme(legend.position = "none")
+p_angle_noleg <- p_angle + theme(legend.position = "none")
+
+p_main <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    p_step_noleg,
+    x = 0.00,
+    y = 0,
+    width = 0.5,
+    height = 1
+  ) +
+  cowplot::draw_plot(
+    p_angle_noleg,
+    x = 0.52,
+    y = 0,
+    width = 0.43,
+    height = 1
+  )
+
+legend_left <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    legend_dist,
+    x = -0.1,
+    y = 0,
+    width = 0.75,
+    height = 1
+  )
+
+p_dist <- cowplot::plot_grid(
+  p_main,
+  legend_left,
+  ncol = 1,
+  rel_heights = c(1, 0.14)
+)
+
+print(p_dist)
+
+save_pdf(
+  filename = here::here("figure", "HMM_distribution.pdf"),
+  plot = p_dist,
+  size = FIGURE_SIZES$hmm_distribution
+)
+```
+
+
+
+### Figure 2: (a)step, (b)angle
+
+plot
+
+```{r}
+plot_point_df <- par_by_id %>%
+  dplyr::mutate(id = as.character(id)) %>%
+  dplyr::select(
+    -dplyr::any_of(c(
+      "success_rate",
+      "success_rate.x",
+      "success_rate.y"
+    ))
+  ) %>%
+  dplyr::left_join(success_rate_by_id, by = "id") %>%
+  dplyr::select(
+    id,
+    success_rate,
+    step_mean_directed,
+    step_mean_undirected,
+    angle_conc_directed,
+    angle_conc_undirected
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -c(id, success_rate),
+    names_to = c("parameter_raw", "state"),
+    names_pattern = "(step_mean|angle_conc)_(.*)",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    state_lab = dplyr::case_when(
+      state == "directed" ~ "Directed flight",
+      state == "undirected" ~ "Undirected flight"
+    ),
+    parameter_lab = dplyr::case_when(
+      parameter_raw == "step_mean" ~ "Mean step length (m)",
+      parameter_raw == "angle_conc" ~ "Turning-angle concentration"
+    ),
+    state_lab = factor(
+      state_lab,
+      levels = c("Directed flight", "Undirected flight")
+    ),
+    parameter_lab = factor(
+      parameter_lab,
+      levels = c(
+        "Mean step length (m)",
+        "Turning-angle concentration"
+      )
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(success_rate),
+    !is.na(value),
+    !is.na(state_lab),
+    !is.na(parameter_lab)
+  )
+```
+
+
+HMM parameters
+
+```{r}
+success_rate_original <- score$success_rate
+score_mean <- mean(success_rate_original, na.rm = TRUE)
+score_sd   <- sd(success_rate_original, na.rm = TRUE)
+
+score_sc_range <- range(best$data$score_sc, na.rm = TRUE)
+score_seq <- seq(score_sc_range[1], score_sc_range[2], length.out = 200)
+
+step_beta  <- unlist(best$mle$step)
+angle_beta <- unlist(best$mle$angle)
+Sigma <- best$mod$Sigma
+n_step <- length(step_beta)
+
+state_levels <- c("directed", "undirected")
+
+cols_2 <- HMM_STATE_COLOURS[c("directed", "undirected")]
+
+# Function to calculate fitted values and 95% CI
+
+make_ci_param <- function(b0, b1, V, x, state, parameter) {
+  
+  eta <- b0 + b1 * x
+  se_eta <- sqrt(V[1, 1] + x^2 * V[2, 2] + 2 * x * V[1, 2])
+  z <- qnorm(0.975)
+  
+  tibble::tibble(
+    score_sc = x,
+    success_rate = x * score_sd + score_mean,
+    state = state,
+    parameter = parameter,
+    fit = exp(eta),
+    lower = exp(eta - z * se_eta),
+    upper = exp(eta + z * se_eta)
+  )
+}
+
+
+# Build prediction table from covariate HMM
+
+param_df <- dplyr::bind_rows(
+  make_ci_param(
+    b0 = step_beta[1],
+    b1 = step_beta[2],
+    V = Sigma[c(1, 2), c(1, 2)],
+    x = score_seq,
+    state = "directed",
+    parameter = "step_mean"
+  ),
+  make_ci_param(
+    b0 = step_beta[3],
+    b1 = step_beta[4],
+    V = Sigma[c(3, 4), c(3, 4)],
+    x = score_seq,
+    state = "undirected",
+    parameter = "step_mean"
+  ),
+  make_ci_param(
+    b0 = angle_beta[1],
+    b1 = angle_beta[2],
+    V = Sigma[n_step + c(1, 2), n_step + c(1, 2)],
+    x = score_seq,
+    state = "directed",
+    parameter = "angle_concentration"
+  ),
+  make_ci_param(
+    b0 = angle_beta[3],
+    b1 = angle_beta[4],
+    V = Sigma[n_step + c(3, 4), n_step + c(3, 4)],
+    x = score_seq,
+    state = "undirected",
+    parameter = "angle_concentration"
+  )
+) %>%
+  dplyr::mutate(
+    state = factor(state, levels = state_levels),
+    parameter = factor(
+      parameter,
+      levels = c("step_mean", "angle_concentration")
+    )
+  )
+
+
+# Plot function
+
+if (!requireNamespace("ggh4x", quietly = TRUE)) {
+  stop("Package 'ggh4x' is required. Install it before rendering this notebook.")
+}
+
+plot_param_df <- param_df %>%
+  dplyr::filter(
+    state %in% c("directed", "undirected"),
+    parameter %in% c("step_mean", "angle_concentration")
+  ) %>%
+  dplyr::mutate(
+    state_lab = dplyr::case_when(
+      state == "directed" ~ "Directed flight",
+      state == "undirected" ~ "Undirected flight"
+    ),
+    parameter_lab = dplyr::case_when(
+      parameter == "step_mean" ~ "Mean step length (m)",
+      parameter == "angle_concentration" ~ "Turning-angle concentration"
+    ),
+    state_lab = factor(
+      state_lab,
+      levels = c("Directed flight", "Undirected flight")
+    ),
+    parameter_lab = factor(
+      parameter_lab,
+      levels = c("Mean step length (m)", "Turning-angle concentration")
+    )
+  )
+
+cols_2_lab <- HMM_LABEL_COLOURS[c("Directed flight", "Undirected flight")]
+
+p_hmm_score_effects_2x2 <- ggplot(
+  plot_param_df,
+  aes(x = success_rate, y = fit, colour = state_lab, fill = state_lab)
+) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.20,
+    colour = NA
+  ) +
+  geom_line(
+    linewidth = 1.3
+  ) +
+  geom_point(
+  data = plot_point_df,
+  aes(
+    x = success_rate,
+    y = value,
+    colour = state_lab
+  ),
+  inherit.aes = FALSE,
+  shape = 21,
+  fill = "white",
+  stroke = 0.8,
+  size = 3,
+  alpha = 0.9
+) +
+  ggh4x::facet_grid2(
+    rows = vars(parameter_lab),
+    cols = vars(state_lab),
+    scales = "free_y",
+    independent = "y",
+    axes = "x",
+    remove_labels = "none",
+    switch = "y"
+  ) +
+  ggh4x::facetted_pos_scales(
+    y = list(
+      parameter_lab == "Mean step length (m)" ~
+        scale_y_continuous(
+          labels = scales::label_number(
+            accuracy = 1,
+            big.mark = ""
+          )
+        ),
+      parameter_lab == "Turning-angle concentration" ~
+        scale_y_continuous(
+          labels = scales::label_number(
+            accuracy = 0.1
+          )
+        )
+    )
+  ) +
+  scale_colour_manual(values = cols_2_lab) +
+  scale_fill_manual(values = cols_2_lab) +
+  scale_x_continuous(
+    breaks = c(0, 0.2, 0.4, 0.6),
+    labels = scales::label_number(accuracy = 0.1)
+  ) +
+  labs(
+    x = "Cylinder-task success rate",
+    y = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.x = element_text(
+      size = 24,
+      margin = margin(t = 0, b = 15)
+    ),
+    strip.text.y.left = element_text(
+      size = 20,
+      angle = 90,
+      margin = margin(r = 10)
+    ),
+    
+    axis.title.x = element_text(
+      size = 20,
+      margin = margin(t = 12)
+    ),
+    axis.text = element_text(size = 16),
+    axis.line = element_blank(),
+    axis.ticks.x = element_line(),
+    axis.text.x = element_text(size = 16),
+    
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8
+    ),
+    
+    panel.spacing.x = grid::unit(1.0, "lines"),
+    panel.spacing.y = grid::unit(1.5, "lines"),
+    
+    plot.margin = margin(t = 6, r = 8, b = 6, l = 6)
+  )
+
+p_hmm_score_effects_2x2
+
+save_pdf(
+  filename = here::here("figure", "HMM_score_effects.pdf"),
+  plot = p_hmm_score_effects_2x2,
+  size = FIGURE_SIZES$hmm_score_effects
+)
+```
+
+
+## Figure 3: Behavioural residency time and stationary probability
+
+Behavioural residency time data frame
+```{r}
+# Setting 
+
+dt_min <- 5
+
+state_breaks <- c("directed", "undirected", "ARS", "water")
+
+state_labels <- HMM_STATE_LABELS_ON_WATER
+state_cols <- HMM_STATE_COLOURS
+
+score_mean <- mean(score$success_rate, na.rm = TRUE)
+score_sd   <- sd(score$success_rate, na.rm = TRUE)
+
+score_seq <- seq(
+  min(best$data$score_sc, na.rm = TRUE),
+  max(best$data$score_sc, na.rm = TRUE),
+  length.out = 100
+)
+
+score_grid <- tibble::tibble(
+  score_sc = score_seq,
+  success_rate = score_sc * score_sd + score_mean
+)
+```
+
+
+```{r}
+dwell_from_p <- function(p, dt_min = 5) {
+  dplyr::if_else(
+    is.finite(p) & p >= 0 & p < 1,
+    dt_min / (1 - p),
+    NA_real_
+  )
+}
+
+extract_self_transition_ci <- function(model, cov_row, stateNames, alpha = 0.95) {
+  
+  ci <- momentuHMM::CIreal(
+    model,
+    covs = cov_row,
+    parms = "gamma",
+    alpha = alpha
+  )
+  
+  gamma_ci <- ci$gamma
+  
+  est_mat   <- gamma_ci$est
+  lower_mat <- gamma_ci$lower
+  upper_mat <- gamma_ci$upper
+  
+  rownames(est_mat) <- colnames(est_mat) <- stateNames
+  rownames(lower_mat) <- colnames(lower_mat) <- stateNames
+  rownames(upper_mat) <- colnames(upper_mat) <- stateNames
+  
+  tibble::tibble(
+    state = stateNames,
+    self_p = diag(est_mat),
+    self_p_lower = diag(lower_mat),
+    self_p_upper = diag(upper_mat)
+  )
+}
+
+dwell_df <- purrr::map_dfr(seq_len(nrow(score_grid)), function(i) {
+  
+  cov_row <- score_grid[i, "score_sc", drop = FALSE]
+  
+  extract_self_transition_ci(
+    model = best,
+    cov_row = cov_row,
+    stateNames = stateNames,
+    alpha = 0.95
+  ) %>%
+    dplyr::mutate(
+      score_sc = score_grid$score_sc[i],
+      success_rate = score_grid$success_rate[i]
+    )
+}) %>%
+  dplyr::mutate(
+    state = factor(state, levels = state_breaks),
+    
+    fit = dwell_from_p(self_p, dt_min),
+    lower_raw = dwell_from_p(self_p_lower, dt_min),
+    upper_raw = dwell_from_p(self_p_upper, dt_min),
+    
+    lower = pmin(lower_raw, upper_raw, na.rm = FALSE),
+    upper = pmax(lower_raw, upper_raw, na.rm = FALSE),
+    
+    has_ci = is.finite(lower) & is.finite(upper)
+  )
+```
+
+Stationary probability data frame
+
+```{r}
+# Clay et al. 2020 (ci.stationary)
+
+#######
+ci.stationary <- function(model, cov, alpha = 0.95) {
+  gridLength <- nrow(cov)
+  model2 <- momentuHMM:::delta_bc(model)
+  nbStates <- length(model2$stateNames)
+  Sigma <- model2$mod$Sigma
+
+  lci <- matrix(NA, gridLength, nbStates)
+  uci <- matrix(NA, gridLength, nbStates)
+
+  formula <- model2$conditions$formula
+  newForm <- momentuHMM:::newFormulas(formula, nbStates)
+  newformula <- newForm$newformula
+
+  nbCovs <- ncol(model.matrix(newformula, model2$data)) - 1
+
+  gamInd <- (length(model2$mod$estimate) - (nbCovs + 1) * nbStates * (nbStates - 1) + 1):length(model2$mod$estimate) -
+    ncol(model2$covsDelta) * (nbStates - 1) * (!model2$conditions$stationary)
+
+  rawCovs <- model2$rawCovs
+  rawCovs <- rawCovs[, order(names(rawCovs)), drop = FALSE]
+  tempCovs <- cov
+  tempCovs <- tempCovs[, sort(names(rawCovs)), drop = FALSE]
+
+  for (i in which(unlist(lapply(rawCovs, is.factor)))) {
+    tempCovs[[i]] <- factor(tempCovs[[i]], levels = levels(rawCovs[, i]))
+  }
+
+  tmpSplineInputs <- momentuHMM:::getSplineFormula(
+    newformula,
+    model2$data,
+    tempCovs
+  )
+
+  desMat <- model.matrix(
+    tmpSplineInputs$formula,
+    data = tmpSplineInputs$covs
+  )
+
+  probs <- as.data.frame(
+    momentuHMM::stationary(model2, covs = desMat)
+  )
+
+  for (state in seq_len(nbStates)) {
+    dN <- t(apply(desMat, 1, function(x) {
+      numDeriv::grad(
+        momentuHMM:::get_stat,
+        model2$mod$estimate[gamInd][unique(c(model2$conditions$betaCons))],
+        covs = matrix(x, nrow = 1),
+        nbStates = nbStates,
+        i = state,
+        betaRef = model2$conditions$betaRef,
+        betaCons = model2$conditions$betaCons,
+        workBounds = model2$conditions$workBounds$beta
+      )
+    }))
+
+    se <- t(apply(dN, 1, function(x) {
+      suppressWarnings(
+        sqrt(
+          x %*%
+            Sigma[
+              gamInd[unique(c(model2$conditions$betaCons))],
+              gamInd[unique(c(model2$conditions$betaCons))]
+            ] %*%
+            x
+        )
+      )
+    }))
+
+    z <- stats::qnorm(1 - (1 - alpha) / 2)
+
+    lci[, state] <- 1 / (
+      1 + exp(-(
+        log(probs[, state] / (1 - probs[, state])) -
+          z * (1 / (probs[, state] - probs[, state]^2)) * se
+      ))
+    )
+
+    uci[, state] <- 1 / (
+      1 + exp(-(
+        log(probs[, state] / (1 - probs[, state])) +
+          z * (1 / (probs[, state] - probs[, state]^2)) * se
+      ))
+    )
+  }
+
+  lci <- as.data.frame(lci)
+  names(lci) <- model$stateNames
+
+  uci <- as.data.frame(uci)
+  names(uci) <- model$stateNames
+
+  list(
+    lower = lci,
+    upper = uci
+  )
+}
+######
+
+stationary_est <- as.data.frame(
+  momentuHMM::stationary(
+    model = best,
+    covs = score_grid %>% dplyr::select(score_sc)
+  )
+)
+
+stationary_ci <- ci.stationary(
+  model = best,
+  cov = score_grid %>% dplyr::select(score_sc),
+  alpha = 0.95
+)
+
+stationary_df <- tibble::tibble(
+  score_sc = score_grid$score_sc,
+  success_rate = score_grid$success_rate
+) %>%
+  dplyr::bind_cols(stationary_est) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(stateNames),
+    names_to = "state",
+    values_to = "fit"
+  ) %>%
+  dplyr::left_join(
+    tibble::tibble(
+      score_sc = score_grid$score_sc,
+      success_rate = score_grid$success_rate
+    ) %>%
+      dplyr::bind_cols(stationary_ci$lower) %>%
+      tidyr::pivot_longer(
+        cols = dplyr::all_of(stateNames),
+        names_to = "state",
+        values_to = "lower"
+      ),
+    by = c("score_sc", "success_rate", "state")
+  ) %>%
+  dplyr::left_join(
+    tibble::tibble(
+      score_sc = score_grid$score_sc,
+      success_rate = score_grid$success_rate
+    ) %>%
+      dplyr::bind_cols(stationary_ci$upper) %>%
+      tidyr::pivot_longer(
+        cols = dplyr::all_of(stateNames),
+        names_to = "state",
+        values_to = "upper"
+      ),
+    by = c("score_sc", "success_rate", "state")
+  ) %>%
+  dplyr::mutate(
+    state = factor(state, levels = state_breaks),
+    has_ci = is.finite(lower) & is.finite(upper)
+  )
+```
+
+
+```{r}
+x_max <- max(score$success_rate, na.rm = TRUE)
+
+# ------------------------------------------------------------
+# Theme
+# ------------------------------------------------------------
+
+theme_time_state <- theme_classic() +
+  theme(
+    axis.text.x = element_text(size = 20),
+    axis.text.y = element_text(size = 20),
+    axis.title.x = element_text(size = 22, margin = margin(t = 12)),
+    axis.title.y = element_text(size = 22, margin = margin(r = 12)),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.line = element_blank(),
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8
+    )
+  )
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+plot_time_state <- function(df, ylab_text, panel_label) {
+  
+  ggplot(df, aes(x = success_rate, y = fit)) +
+    geom_ribbon(
+      data = df %>% dplyr::filter(has_ci),
+      aes(
+        ymin = lower,
+        ymax = upper,
+        fill = state
+      ),
+      alpha = 0.20,
+      colour = NA
+    ) +
+    geom_line(
+      aes(colour = state),
+      linewidth = 1.3
+    ) +
+    annotate(
+      "text",
+      x = -Inf,
+      y = Inf,
+      label = panel_label,
+      parse = TRUE,
+      hjust = -0.3,
+      vjust = 1.6,
+      size = 9
+    ) +
+    scale_x_continuous(
+      limits = c(0, x_max),
+      breaks = c(0, 0.2, 0.4, 0.6),
+      labels = scales::label_number(accuracy = 0.1)
+    ) +
+    scale_colour_manual(
+      name = "State",
+      values = state_cols,
+      breaks = state_breaks,
+      labels = state_labels
+    ) +
+    scale_fill_manual(
+      name = "State",
+      values = state_cols,
+      breaks = state_breaks,
+      labels = state_labels
+    ) +
+    labs(
+      x = "Cylinder-task success rate",
+      y = ylab_text,
+      colour = "State",
+      fill = "State"
+    ) +
+    theme_time_state
+}
+
+p_dwell <- plot_time_state(
+  df = dwell_df,
+  ylab_text = "Expected state duration (min)",
+  panel_label = "'(' * italic(a) * ')'"
+)
+
+p_stationary <- plot_time_state(
+  df = stationary_df,
+  ylab_text = "Stationary probability",
+  panel_label = "'(' * italic(b) * ')'"
+)
+
+# ------------------------------------------------------------
+# Combine and save
+# ------------------------------------------------------------
+
+legend_bottom <- cowplot::get_legend(
+  p_stationary +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.title = element_blank()
+    ) +
+    guides(
+      colour = guide_legend(nrow = 1),
+      fill = guide_legend(nrow = 1)
+    )
+)
+
+p_main <- cowplot::plot_grid(
+  p_dwell + theme(
+    legend.position = "none",
+    plot.margin = margin(t = 5, r = 14, b = 5, l = 5)
+  ),
+  p_stationary + theme(
+    legend.position = "none",
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 14)
+  ),
+  nrow = 1,
+  rel_widths = c(1, 1),
+  align = "hv",
+  axis = "tb"
+)
+
+legend_left <- cowplot::plot_grid(
+  NULL,
+  legend_bottom,
+  NULL,
+  nrow = 1,
+  rel_widths = c(0.08, 0.50, 0.42)
+)
+
+p_time_stationary <- cowplot::plot_grid(
+  p_main,
+  legend_left,
+  ncol = 1,
+  rel_heights = c(1, 0.13)
+)
+
+p_time_stationary
+
+save_pdf(
+  filename = here::here("figure", "HMM_dwell_time_stationary_probability.pdf"),
+  plot = p_time_stationary,
+  size = FIGURE_SIZES$hmm_residency
+)
+```
+
+
+### Figure S2
+
+Prepare individual-level HMM parameter data
+
+```{r}
+required_hmm_objects <- c("model_by_id", "id_model_summary", "state_prop_by_id", "par_by_id")
+missing_hmm_objects <- required_hmm_objects[!vapply(required_hmm_objects, exists, logical(1))]
+if (length(missing_hmm_objects) > 0) {
+  stop("Loaded RDS is missing required individual HMM objects: ", paste(missing_hmm_objects, collapse = ", "))
+}
+id_model_summary
+state_prop_by_id
+par_by_id
+```
+Fit GLMs and create predictions
+
+```{r}
+out_dir <- here::here("figure", "individual_HMM")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------
+# Settings
+# ------------------------------------------------------------
+
+state_levels <- c("directed", "undirected")
+
+cols_2 <- HMM_STATE_COLOURS[c("directed", "undirected")]
+
+# ------------------------------------------------------------
+# Prepare individual-level HMM parameter data
+# ------------------------------------------------------------
+
+ind_param_df <- par_by_id %>%
+  dplyr::mutate(id = as.character(id)) %>%
+  dplyr::select(
+    -dplyr::any_of(c(
+      "success_rate",
+      "success_rate.x",
+      "success_rate.y"
+    ))
+  ) %>%
+  dplyr::left_join(success_rate_by_id, by = "id") %>%
+  dplyr::select(
+    id,
+    success_rate,
+    step_mean_directed,
+    step_mean_undirected,
+    angle_conc_directed,
+    angle_conc_undirected
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -c(id, success_rate),
+    names_to = c("parameter_raw", "state"),
+    names_pattern = "(step_mean|angle_conc)_(.*)",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    state = factor(state, levels = state_levels),
+    parameter = dplyr::recode(
+      parameter_raw,
+      step_mean = "step_mean",
+      angle_conc = "angle_concentration"
+    ),
+    parameter = factor(
+      parameter,
+      levels = c("step_mean", "angle_concentration")
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(success_rate),
+    !is.na(value),
+    !is.na(state)
+  )
+
+# ------------------------------------------------------------
+# Fit GLMs and create prediction table
+# ------------------------------------------------------------
+
+make_glm_pred <- function(dat) {
+  
+  dat <- dat %>%
+    dplyr::filter(value > 0)
+  
+  m <- glmmTMB::glmmTMB(
+    value ~ success_rate,
+    data = dat,
+    family = lognormal(link = "log")
+  )
+  
+  newdat <- tibble::tibble(
+    success_rate = seq(
+      min(dat$success_rate, na.rm = TRUE),
+      max(dat$success_rate, na.rm = TRUE),
+      length.out = 100
+    )
+  )
+  
+  pr <- predict(
+    m,
+    newdata = newdat,
+    se.fit = TRUE,
+    type = "link"
+  )
+  
+  newdat %>%
+    dplyr::mutate(
+      fit = exp(pr$fit),
+      lower = exp(pr$fit - qnorm(0.975) * pr$se.fit),
+      upper = exp(pr$fit + qnorm(0.975) * pr$se.fit)
+    )
+}
+
+glm_results <- ind_param_df %>%
+  dplyr::filter(value > 0) %>%
+  dplyr::group_by(parameter, state) %>%
+  tidyr::nest() %>%
+  dplyr::mutate(
+    model = purrr::map(
+      data,
+      ~ glmmTMB::glmmTMB(
+        value ~ success_rate,
+        data = .x,
+        family = lognormal(link = "log")
+      )
+    ),
+    pred = purrr::map(data, make_glm_pred),
+    model_summary = purrr::map(model, summary)
+  ) %>%
+  dplyr::ungroup()
+
+glm_pred_df <- glm_results %>%
+  dplyr::select(parameter, state, pred) %>%
+  tidyr::unnest(pred)
+
+glm_summary_list <- glm_results %>%
+  dplyr::select(parameter, state, model_summary)
+
+# ------------------------------------------------------------
+# Print model summaries
+# ------------------------------------------------------------
+
+glm_summary_list %>%
+  dplyr::mutate(
+    label = paste(parameter, state, sep = " | ")
+  ) %>%
+  dplyr::select(label, model_summary) %>%
+  purrr::pwalk(function(label, model_summary) {
+    
+    cat("\n\n")
+    cat("============================================================\n")
+    cat(label, "\n")
+    cat("============================================================\n\n")
+    
+    print(model_summary)
+  })
+```
+
+
+Plot
+
+```{r}
+# ------------------------------------------------------------
+# Individual-level HMM GLM figure: compact facet version
+# ------------------------------------------------------------
+
+if (!requireNamespace("ggh4x", quietly = TRUE)) {
+  stop("Package 'ggh4x' is required. Install it before rendering this notebook.")
+}
+
+plot_pred_df <- glm_pred_df %>%
+  dplyr::filter(
+    state %in% c("directed", "undirected"),
+    parameter %in% c("step_mean", "angle_concentration")
+  ) %>%
+  dplyr::mutate(
+    state_lab = dplyr::case_when(
+      state == "directed" ~ "Directed flight",
+      state == "undirected" ~ "Undirected flight"
+    ),
+    parameter_lab = dplyr::case_when(
+      parameter == "step_mean" ~ "Step length mean (m)",
+      parameter == "angle_concentration" ~ "Angle concentration (\u03BA)"
+    ),
+    state_lab = factor(
+      state_lab,
+      levels = c("Directed flight", "Undirected flight")
+    ),
+    parameter_lab = factor(
+      parameter_lab,
+      levels = c("Step length mean (m)", "Angle concentration (\u03BA)")
+    )
+  )
+
+plot_point_df <- ind_param_df %>%
+  dplyr::filter(
+    state %in% c("directed", "undirected"),
+    parameter %in% c("step_mean", "angle_concentration")
+  ) %>%
+  dplyr::mutate(
+    state_lab = dplyr::case_when(
+      state == "directed" ~ "Directed flight",
+      state == "undirected" ~ "Undirected flight"
+    ),
+    parameter_lab = dplyr::case_when(
+      parameter == "step_mean" ~ "Step length mean (m)",
+      parameter == "angle_concentration" ~ "Angle concentration (\u03BA)"
+    ),
+    state_lab = factor(
+      state_lab,
+      levels = c("Directed flight", "Undirected flight")
+    ),
+    parameter_lab = factor(
+      parameter_lab,
+      levels = c("Step length mean (m)", "Angle concentration (\u03BA)")
+    )
+  )
+
+cols_2_lab <- HMM_LABEL_COLOURS[c("Directed flight", "Undirected flight")]
+
+p_ind_glm_2x2 <- ggplot(
+  plot_pred_df,
+  aes(x = success_rate, y = fit, colour = state_lab, fill = state_lab)
+) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.2,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1.3) +
+  geom_point(
+    data = plot_point_df,
+    aes(x = success_rate, y = value, colour = state_lab),
+    inherit.aes = FALSE,
+    size = 3,
+    shape = 21,
+    fill = "white",
+    stroke = 0.8,
+    alpha = 0.9
+  ) +
+  ggh4x::facet_grid2(
+  rows = vars(parameter_lab),
+  cols = vars(state_lab),
+  scales = "free_y",
+  independent = "y",
+  axes = "x",
+  remove_labels = "none",
+  switch = "y"
+) +
+  ggh4x::facetted_pos_scales(
+  y = list(
+    parameter_lab == "Step length mean (m)" ~
+      scale_y_continuous(
+        labels = scales::label_number(
+          accuracy = 1,
+          big.mark = ""
+        )
+      ),
+    parameter_lab == "Angle concentration (\u03BA)" ~
+      scale_y_continuous(
+        labels = scales::label_number(
+          accuracy = 0.1
+        )
+      )
+  )
+  ) +
+  scale_colour_manual(values = cols_2_lab) +
+  scale_fill_manual(values = cols_2_lab) +
+  scale_x_continuous(
+    breaks = c(0, 0.2, 0.4, 0.6),
+    labels = scales::label_number(accuracy = 0.1)
+  ) +
+  labs(
+    x = "Success rate",
+    y = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.x = element_text(size = 24,margin = margin(t = 0, b = 15)),
+    strip.text.y.left = element_text(size = 20, angle = 90, margin = margin(r = 10)),
+    axis.title.x = element_text(size = 20, margin = margin(t = 12)),
+    axis.text = element_text(size = 16),
+    axis.line = element_blank(),
+    axis.ticks.x = element_line(),
+    axis.text.x = element_text(size = 16),
+    
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8
+    ),
+    
+    panel.spacing.x = grid::unit(1.0, "lines"),
+    panel.spacing.y = grid::unit(1.5, "lines"),
+    
+    plot.margin = margin(t = 6, r = 8, b = 6, l = 6)
+  )
+
+p_ind_glm_2x2
+
+save_pdf(
+  filename = here::here("figure", "individual_HMM_GLM.pdf"),
+  plot = p_ind_glm_2x2,
+  size = FIGURE_SIZES$individual_hmm_glm
+)
+```
+
+
+# Additional stationary-distribution output
+# Figure: proportion of Viterbi states by individual
+Covariate HMM
+```{r}
+# Viterbi states from the covariate HMM
+vit <- momentuHMM::viterbi(best)
+
+if (length(vit) != nrow(Data_HMM)) {
+  stop("Length of Viterbi states does not match nrow(Data_HMM).")
+}
+
+viterbi_prop_df <- Data_HMM %>%
+  dplyr::mutate(
+    id = as.character(id),
+    viterbi_state = if (is.numeric(vit) || is.integer(vit)) {
+      factor(vit, levels = seq_along(stateNames), labels = stateNames)
+    } else {
+      factor(vit, levels = stateNames)
+    }
+  ) %>%
+  dplyr::filter(!is.na(viterbi_state)) %>%
+  dplyr::count(id, state = viterbi_state, name = "n") %>%
+  tidyr::complete(
+    id,
+    state = factor(stateNames, levels = stateNames),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(id) %>%
+  dplyr::mutate(
+    prop = n / sum(n)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(success_rate_by_id, by = "id") %>%
+  dplyr::filter(!is.na(success_rate)) %>%
+  dplyr::mutate(
+    state_lab = dplyr::recode(
+      as.character(state),
+      directed = "Directed flight",
+      undirected = "Undirected flight",
+      ARS = "ARS",
+      water = "Water"
+    ),
+    # Stack order:
+    # ggplot stacks from bottom to top by factor order.
+    # To make the visible order from top to bottom:
+    # Directed -> Undirected -> ARS -> Water,
+    # set bottom-to-top order as:
+    # Water -> ARS -> Undirected -> Directed.
+    state_lab = factor(
+      state_lab,
+      levels = c(
+        "Water",
+        "ARS",
+        "Undirected flight",
+        "Directed flight"
+      )
+    )
+  )
+
+# Order individuals by increasing success rate
+id_success_order <- success_rate_by_id %>%
+  dplyr::filter(id %in% viterbi_prop_df$id) %>%
+  dplyr::arrange(success_rate, id) %>%
+  dplyr::mutate(
+    id_success_lab = scales::number(
+      success_rate,
+      accuracy = 0.01
+    )
+  ) %>%
+  dplyr::select(id, success_rate, id_success_lab)
+
+viterbi_prop_df <- viterbi_prop_df %>%
+  dplyr::mutate(
+    id_success_fct = factor(
+      id,
+      levels = id_success_order$id
+    )
+  )
+
+# Colours consistent with earlier figures
+cols_4_lab <- HMM_LABEL_COLOURS
+
+p_viterbi_state_prop_by_success <- ggplot(
+  viterbi_prop_df,
+  aes(x = id_success_fct, y = prop, fill = state_lab)
+) +
+  geom_col(width = 0.55, alpha = 0.5) +
+  scale_fill_manual(
+    values = cols_4_lab,
+    breaks = c("Directed flight", "Undirected flight", "ARS", "Water"),
+    guide = guide_legend(nrow = 1, byrow = TRUE)
+  ) +
+  scale_x_discrete(
+    labels = stats::setNames(
+      id_success_order$id_success_lab,
+      id_success_order$id
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = expression(italic("(a)") ~ "Covariate HMM"),
+    x = "Success rate",
+    y = "Proportion of Viterbi states",
+    fill = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 17, hjust = 0),
+    axis.title.x = element_text(size = 18, margin = margin(t = 12)),
+    axis.title.y = element_text(size = 18, margin = margin(r = 12)),
+    axis.text.x = element_text(size = 11, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 14),
+    legend.text = element_text(size = 13),
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = 0.5),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    plot.margin = margin(t = 6, r = 8, b = 6, l = 6)
+  )
+```
+
+## Results from individual-level HMMs
+```{r}
+# ------------------------------------------------------------
+# Figure: proportion of Viterbi states by individual
+# Individual-level HMMs
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Extract Viterbi states from each individual-level HMM
+# ------------------------------------------------------------
+
+viterbi_prop_ind_df <- purrr::imap_dfr(model_by_id, function(m_i, id_i) {
+  
+  if (is.null(m_i)) {
+    return(NULL)
+  }
+  
+  dat_i <- m_i$data
+  vit_i <- momentuHMM::viterbi(m_i)
+  
+  if (length(vit_i) != nrow(dat_i)) {
+    stop(paste0(
+      "Length of Viterbi states does not match nrow(data) for id: ",
+      id_i
+    ))
+  }
+  
+  dat_i %>%
+    dplyr::mutate(
+      id = as.character(id_i),
+      viterbi_state = if (is.numeric(vit_i) || is.integer(vit_i)) {
+        factor(
+          vit_i,
+          levels = seq_along(stateNames_ind),
+          labels = stateNames_ind
+        )
+      } else {
+        factor(
+          vit_i,
+          levels = stateNames_ind
+        )
+      }
+    ) %>%
+    dplyr::select(id, viterbi_state)
+})
+
+# ------------------------------------------------------------
+# Calculate state proportions by individual
+# ------------------------------------------------------------
+
+viterbi_prop_ind_df <- viterbi_prop_ind_df %>%
+  dplyr::filter(!is.na(viterbi_state)) %>%
+  dplyr::count(id, state = viterbi_state, name = "n") %>%
+  tidyr::complete(
+    id,
+    state = factor(stateNames_ind, levels = stateNames_ind),
+    fill = list(n = 0)
+  ) %>%
+  dplyr::group_by(id) %>%
+  dplyr::mutate(
+    prop = n / sum(n)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(success_rate_by_id, by = "id") %>%
+  dplyr::filter(!is.na(success_rate)) %>%
+  dplyr::mutate(
+    state_lab = dplyr::recode(
+      as.character(state),
+      directed = "Directed flight",
+      undirected = "Undirected flight",
+      ARS = "ARS",
+      water = "Water"
+    ),
+    # Stack order:
+    # ggplot stacks from bottom to top by factor order.
+    # Visible order from top to bottom:
+    # Directed -> Undirected -> ARS -> Water
+    state_lab = factor(
+      state_lab,
+      levels = c(
+        "Water",
+        "ARS",
+        "Undirected flight",
+        "Directed flight"
+      )
+    )
+  )
+
+# ------------------------------------------------------------
+# Order individuals by increasing success rate
+# ------------------------------------------------------------
+
+id_success_order_ind <- success_rate_by_id %>%
+  dplyr::filter(id %in% viterbi_prop_ind_df$id) %>%
+  dplyr::arrange(success_rate, id) %>%
+  dplyr::mutate(
+    id_success_lab = scales::number(
+      success_rate,
+      accuracy = 0.01
+    )
+  ) %>%
+  dplyr::select(id, success_rate, id_success_lab)
+
+viterbi_prop_ind_df <- viterbi_prop_ind_df %>%
+  dplyr::mutate(
+    id_success_fct = factor(
+      id,
+      levels = id_success_order_ind$id
+    )
+  )
+
+# Colours consistent with earlier figures
+cols_4_lab <- HMM_LABEL_COLOURS
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+p_viterbi_state_prop_by_success_ind <- ggplot(
+  viterbi_prop_ind_df,
+  aes(x = id_success_fct, y = prop, fill = state_lab)
+) +
+  geom_col(width = 0.55, alpha = 0.5) +
+  scale_fill_manual(
+    values = cols_4_lab,
+    breaks = c("Directed flight", "Undirected flight", "ARS", "Water"),
+    guide = guide_legend(nrow = 1, byrow = TRUE)
+  ) +
+  scale_x_discrete(
+    labels = stats::setNames(
+      id_success_order_ind$id_success_lab,
+      id_success_order_ind$id
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = expression(italic("(b)") ~ "Individually fitted HMMs"),
+    x = "Success rate",
+    y = "Proportion of Viterbi states",
+    fill = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 17, hjust = 0),
+    axis.title.x = element_text(size = 18, margin = margin(t = 12)),
+    axis.title.y = element_text(size = 18, margin = margin(r = 12)),
+    axis.text.x = element_text(size = 11, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 14),
+    legend.text = element_text(size = 13),
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = 0.5),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    plot.margin = margin(t = 6, r = 8, b = 6, l = 6)
+  )
+```
+
+```{r}
+p_cov_panel <- p_viterbi_state_prop_by_success +
+  ggplot2::theme(
+    legend.position = "none",
+    plot.title = ggplot2::element_text(
+      size = 22,
+      hjust = -0.16,
+      vjust = 1,
+      margin = ggplot2::margin(t = 0, b = 8)
+    ),
+    axis.text.x = ggplot2::element_text(
+      size = 12,
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      margin = ggplot2::margin(t = 0)
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 17,
+      margin = ggplot2::margin(r = 0)
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 18,
+      margin = ggplot2::margin(t = 10)
+    ),
+    axis.title.y = ggplot2::element_text(
+      size = 18,
+      margin = ggplot2::margin(r = 2)
+    ),
+    plot.margin = ggplot2::margin(t = 14, r = 8, b = 6, l = 34)
+  )
+
+p_ind_panel <- p_viterbi_state_prop_by_success_ind +
+  ggplot2::theme(
+    legend.position = "none",
+    plot.title = ggplot2::element_text(
+      size = 22,
+      hjust = -0.16,
+      vjust = 1,
+      margin = ggplot2::margin(t = 0, b = 8)
+    ),
+    axis.text.x = ggplot2::element_text(
+      size = 12,
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      margin = ggplot2::margin(t = 0)
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 17,
+      margin = ggplot2::margin(r = 0)
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 18,
+      margin = ggplot2::margin(t = 10)
+    ),
+    axis.title.y = ggplot2::element_text(
+      size = 18,
+      margin = ggplot2::margin(r = 2)
+    ),
+    plot.margin = ggplot2::margin(t = 14, r = 3, b = 6, l = 40)
+  )
+
+# Shared legend in a single row
+p_legend_source <- p_viterbi_state_prop_by_success +
+  ggplot2::guides(
+    fill = ggplot2::guide_legend(
+      nrow = 1,
+      byrow = TRUE,
+      keywidth = grid::unit(0.6, "cm"),
+      keyheight = grid::unit(0.6, "cm")
+    )
+  ) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.justification = "left",
+    legend.text = ggplot2::element_text(size = 15),
+    legend.key.size = grid::unit(0.6, "cm"),
+    legend.spacing.x = grid::unit(0.15, "cm"),
+    legend.margin = ggplot2::margin(t = 0, r = 0, b = 0, l = 0)
+  )
+
+common_legend <- cowplot::get_legend(p_legend_source)
+
+p_viterbi_panels <- cowplot::plot_grid(
+  NULL,
+  p_cov_panel,
+  NULL,
+  p_ind_panel,
+  NULL,
+  ncol = 5,
+  align = "h",
+  axis = "tb",
+  rel_widths = c(0.01, 1.12, 0.06, 1.12, 0.01)
+)
+
+# Place the legend at the lower left
+legend_left <- cowplot::plot_grid(
+  common_legend,
+  NULL,
+  ncol = 2,
+  rel_widths = c(0.72, 1)
+)
+
+p_viterbi_state_prop_combined <- cowplot::plot_grid(
+  p_viterbi_panels,
+  legend_left,
+  ncol = 1,
+  rel_heights = c(1, 0.10)
+)
+
+p_viterbi_state_prop_combined
+
+save_pdf(
+  filename = here::here(
+    "figure",
+    "Viterbi_state_proportion_combined.pdf"
+  ),
+  plot = p_viterbi_state_prop_combined,
+  size = FIGURE_SIZES$viterbi_combined
+)
+```
