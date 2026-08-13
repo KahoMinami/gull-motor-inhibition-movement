@@ -1,0 +1,13 @@
+.DS_Store
+.RData
+.Rhistory
+.Rproj.user/
+*_cache/
+*_files/
+*.html
+.quarto/
+*.utf8.md
+*.knit.md
+
+# GADM permits academic use but not redistribution without prior permission.
+rawdata/gadm41_JPN_shp/

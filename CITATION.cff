@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use these data or code, please cite the archived Zenodo release."
+title: "Data and code for: Motor inhibition is associated with fine-scale foraging movement in wild gulls"
+type: software
+version: 1.0.0
+date-released: 2026-08-13
+license: MIT
+authors:
+  - family-names: Minami
+    given-names: Kaho
+    orcid: "https://orcid.org/0009-0006-2926-1900"
+  - family-names: Sugiyama
+    given-names: Hibiki
+    orcid: "https://orcid.org/0009-0007-3105-0958"
+  - family-names: Inoue
+    given-names: Sota
+    orcid: "https://orcid.org/0000-0002-4260-8570"
+  - family-names: Mizutani
+    given-names: Yuichi
+    orcid: "https://orcid.org/0000-0002-8521-8759"
+  - family-names: Goto
+    given-names: Yusuke
+    orcid: "https://orcid.org/0000-0003-2767-1501"
+  - family-names: Yoda
+    given-names: Ken
+    orcid: "https://orcid.org/0000-0002-8346-3291"
+keywords:
+  - animal movement
+  - biologging
+  - cognition
+  - GPS tracking
+  - hidden Markov model
+  - Larus crassirostris
